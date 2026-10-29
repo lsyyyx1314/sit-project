@@ -1,45 +1,35 @@
-# SIT 常用目标
-PY := .venv/bin/python
+# SIT 项目顶层入口（100% C++ 实现）
+#
+#   make          编译全部可执行文件
+#   make test     黄金向量交叉校验 + 功能/对抗断言
+#   make bench    攻击矩阵与性能基准
+#   make e2e      端到端验证（4 台软件交换机，需 root）
+#   make deps     安装构建依赖（g++ / make / iproute2）
 
-.PHONY: help provision test r1 bench attack scheme e2e sync all clean
+CPP := cpp
 
-help:
-	@echo "make provision  安装系统与 Python 依赖（Ubuntu 24.04）"
-	@echo "make test       运行单元测试"
-	@echo "make r1         R1 反例取证（申报书式(5)(6) 恒真退化）"
-	@echo "make bench      BPMV 基准（头长/检出率/时延）"
-	@echo "make attack     三方攻击矩阵"
-	@echo "make scheme      MPV-2 性能基准"
-	@echo "make e2e        端到端验证（需 root，Mininet 4 交换机）"
-	@echo "make all        test + r1 + bench"
-	@echo "make sync       从本机同步到虚拟机 ~/SIT"
+.PHONY: all test bench e2e deps clean
 
-provision:
-	bash scripts/provision.sh
+all:
+	$(MAKE) -C $(CPP) all
 
 test:
-	$(PY) -m pytest -q
-
-r1:
-	$(PY) -m sim.counterexample_r1 --json
+	$(MAKE) -C $(CPP) test
 
 bench:
-	$(PY) -m sim.bench_bpmv --json
-
-attack:
-	$(PY) -m sim.attack_matrix --json
-
-scheme:
-	$(PY) -m sim.bench_scheme --json
+	$(MAKE) -C $(CPP) bench
 
 e2e:
-	sudo $(PY) -m exp.e2e_verify
+	$(MAKE) -C $(CPP) e2e
 
-all: test r1 bench
-
-sync:
-	tar -czf - mpv sim tests scripts exp requirements.txt pytest.ini | bash tools/vm/sshrun.sh "cd ~/SIT && tar xzf -"
+deps:
+	@command -v g++ >/dev/null 2>&1 || { \
+	  echo "[deps] 安装 g++ / make / iproute2"; \
+	  sudo apt-get update -y && \
+	  sudo apt-get install -y --no-install-recommends g++ make binutils iproute2; }
+	@echo "[deps] g++ : $$(g++ --version | head -1)"
+	@echo "[deps] make: $$(make --version | head -1)"
 
 clean:
-	find . -name __pycache__ -type d -prune -exec rm -rf {} +
-	rm -rf .pytest_cache
+	$(MAKE) -C $(CPP) clean
+	rm -rf dist
