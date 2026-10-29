@@ -26,6 +26,9 @@ sudo make e2e   # 五轮端到端：正常/标签错配/恶意改头/恶意重�
 sudo make demo  # 演示 APP：浏览器打开 http://<VM地址>:8080
 ```
 
+> 注意：`e2e` 与 `dashboard` 共用 `/tmp/mpv_run` 与 h1/h2 netns 名，不要同时运行；
+> e2e 结束时会清理共享拓扑。演示服务异常时重启即可（`sudo make demo`）。
+
 ## 目录
 
 | 路径 | 内容 |
