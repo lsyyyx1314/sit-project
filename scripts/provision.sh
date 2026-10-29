@@ -72,8 +72,9 @@ done
 
 # ---------------------------------------------------------------- 4. venv
 say "4/6 创建虚拟环境 $PROJ/.venv"
+# --system-site-packages：mininet 由 apt 装在系统 Python 里，venv 需要能看到它
 if [ ! -d "$PROJ/.venv" ]; then
-  python3 -m venv "$PROJ/.venv"
+  python3 -m venv --system-site-packages "$PROJ/.venv"
 fi
 # shellcheck disable=SC1091
 . "$PROJ/.venv/bin/activate"
