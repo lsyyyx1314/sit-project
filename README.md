@@ -19,11 +19,12 @@
 
 ```bash
 make deps       # 安装 g++ / make / iproute2（已装则跳过）
-make            # 编译 6 个可执行文件
+make            # 编译 7 个可执行文件
 make test       # 黄金向量交叉校验 + 功能/对抗/CFMV/定位断言
 make bench      # 攻击矩阵、多候选矩阵、性能与基线对比
 sudo make e2e   # 五轮端到端：正常/标签错配/恶意改头/恶意重放/流级压缩
 sudo make demo  # 演示 APP：浏览器打开 http://<VM地址>:8080
+sudo make exp   # 结题实验：7 组实验一键运行，生成报告与 SVG 图表
 ```
 
 > 注意：`e2e` 与 `dashboard` 共用 `/tmp/mpv_run` 与 h1/h2 netns 名，不要同时运行；
@@ -49,6 +50,7 @@ sudo make demo  # 演示 APP：浏览器打开 http://<VM地址>:8080
 | `bench` | 10 类攻击矩阵 + 多候选(k=2/8/16)矩阵 + 判定时延 + 解析基线对比 |
 | `e2e` | 五轮端到端编排：建拓扑、跑场景、断言、出结论 |
 | `dashboard` | **演示 APP**：纯 C++ HTTP 服务 + 内嵌 Web UI（实时拓扑、场景注入、嫌疑定位、BPMV/CPMV/CFMV 对比） |
+| `exp` | **结题实验套件**：攻击矩阵/多候选/时延/流级/通信开销/头长/端到端统计 7 组实验一键运行，自动生成 `results/exp_report.md` 与 SVG 图表 |
 
 ## 核心设计
 

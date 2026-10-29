@@ -31,6 +31,26 @@ sudo ./cpp/build/dashboard --port 8080   # VM 上运行
 失败包自动定位嫌疑交换机并在拓扑上标红；BPMV / CPMV / CFMV 判定开销实时柱状对比；
 流级压缩窗口实时判定。截图见 `results/dashboard_*.png`。
 
+### 结题实验套件
+
+```bash
+sudo make exp   # 一键运行 7 组实验，自动生成 results/exp_report.md + results/charts/*.svg
+```
+
+VM 实测核心数字（完整数据见 `results/exp_report.md`）：
+
+| 实验 | 结果 |
+|---|---|
+| 十类攻击检出（每组 1 万次） | 100%，诚实接受 100% |
+| 多候选 k=2/8/16 检出/诚实 | 均 100% |
+| 控制器判定时延 | tag 模式 ≈0.26 µs 恒定（与 k 无关），scan 随 k 线性 |
+| CFMV 流级判定 | 0.04 µs，与窗口 N 无关（N=4096） |
+| 控制器上报处理吞吐 | 10 万行/秒（含双口径判定与行解析），窗口 64 压缩 64× |
+| 通信开销 | 流级聚合上报降至每包上报的 0.46%~14%（窗口 250~8） |
+| 验证头 vs 跳数 | 恒定 16B（逐跳追加式 h=16 时 64B，省 75%） |
+| 端到端四类攻击 ×5 轮 | 检出 5/5、定位 5/5、对照项全部正常 |
+| 数据面管道吞吐 | ≈3500 包/秒（用户态 AF_PACKET，4 台交换机串联） |
+
 ---
 
 ## 二、当前状态
@@ -47,7 +67,8 @@ sudo ./cpp/build/dashboard --port 8080   # VM 上运行
 | M4.5 | CFMV 流级压缩（出口聚合 + 控制器一次判定）+ 恶意交换机模拟 | ✅ |
 | M5 | Icing / L-PVS / Atlas 解析口径对比 | ✅ |
 | M5.5 | 演示 APP（dashboard：纯 C++ HTTP 服务 + 实时 Web UI） | ✅ |
-| M6 | 论文与结题 | 待做 |
+| M5.9 | 结题实验套件（exp：7 组实验一键运行，报告+图表自动生成） | ✅ |
+| M6 | 论文与结题 | 实验数据就绪，材料齐备 |
 
 ---
 
@@ -154,12 +175,13 @@ BLAKE2b）。该夹具已冻结入库，Python 源码不再保留。
 | `cpp/include/blake2b.h` / `cpp/src/blake2b.cpp` | RFC 7693 实现，支持可变摘要长度与密钥模式 |
 | `cpp/include/mpv2.h` / `cpp/src/mpv2.cpp` | 模运算、密钥派生、验证头、期望值、判定、CFMV 聚合与流级判定、重放窗口 |
 | `cpp/include/controller.h` / `cpp/src/controller.cpp` | 上报解析（逐包/FLOW/TRACE）、判定、取证定位（首分歧交换机） |
-| `cpp/include/topo.h` / `cpp/src/topo.cpp` | netns+veth 拓扑、场景转发表、交换机进程编排（e2e/dashboard 共用） |
+| `cpp/include/topo.h` / `cpp/src/topo.cpp` | netns+veth 拓扑、场景转发表、交换机进程编排（e2e/dashboard/exp 共用） |
 | `cpp/src/vswitch.cpp` | 软件交换机：AF_PACKET 多端口、转发表热加载、出口上报、流级聚合、逐跳取证、恶意模式 |
 | `cpp/src/verify_reports.cpp` | 离线 CLI 验证器（读上报文件出结论） |
 | `cpp/src/bench.cpp` | 10 类攻击矩阵 + 多候选矩阵 + 判定时延 + 解析基线对比 |
 | `cpp/src/e2e.cpp` | 五轮端到端编排：正常 / 标签错配 / 恶意改头 / 恶意重放 / 流级压缩 |
 | `cpp/src/dashboard.cpp` | 演示 APP：纯 C++ HTTP 服务 + 内嵌 Web UI（实时拓扑、场景注入、定位、对比图表） |
+| `cpp/src/exp.cpp` | 结题实验套件：7 组实验一键运行，自动生成报告与 SVG 图表 |
 | `cpp/tests/test_mpv2.cpp` | 黄金向量交叉校验 + 功能/对抗/CFMV/重放/定位断言 |
 
 ---
@@ -198,8 +220,9 @@ sudo make demo  # 演示 APP，浏览器打开 http://<VM地址>:8080
 
 ## 七、下一步
 
-1. **M6 论文**：MPV-2 构造、CFMV 线性恒等式、取证定位方法学、与基线的解析对比，素材已齐。
-2. 软件著作权申请材料（原型系统 + 演示 APP）。
+1. **M6 论文**：MPV-2 构造、CFMV 线性恒等式、取证定位方法学、与基线的解析对比、
+   结题实验数据（`results/exp_report.md` + `results/charts/`）——素材已全部齐备。
+2. 软件著作权申请材料（原型系统 + 演示 APP + 实验套件）。
 3. 可选：128-bit 域参数档；P4/BMv2 数据面保真度实验。
 
 ---
