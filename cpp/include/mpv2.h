@@ -105,14 +105,49 @@ class ExpectationTable {
   ExpectationTable(const KeyRing& kr, const std::vector<Path>& paths);
   size_t size() const { return table_.size(); }
   const Path& path(size_t i) const { return paths_[i]; }
-  // tag 模式：只检查上报的 tag，O(1)
+  // tag 模式：只检查上报的 tag，O(1) —— CPMV
   Verdict verify_tag(const Header& hdr) const;
-  // scan 模式：遍历候选集，O(k)
+  // scan 模式：遍历候选集，O(k) —— BPMV
   Verdict verify_scan(const Header& hdr) const;
+  // 流级判定（CFMV）：N·A + B·Σh == ΣV，整个窗口一次判定
+  Verdict verify_flow(uint8_t tag, uint64_t n, uint64_t sum_h,
+                      uint64_t sum_v) const;
+  // 流级 scan：tag 不可信时退化为遍历候选集，O(k)
+  Verdict verify_flow_scan(uint64_t n, uint64_t sum_h, uint64_t sum_v) const;
 
  private:
   std::vector<Path> paths_;
   std::vector<Expectation> table_;
+};
+
+// ---------------------------------------------------------------- CFMV 聚合
+// 出口交换机按 (流, tag) 聚合验证信息：N、Σh(nonce)、ΣV。
+// 判定依赖 E(h) = A + B·h 对 h 线性 ⇒ ΣE = N·A + B·Σh。
+struct FlowAgg {
+  uint64_t n = 0;
+  uint64_t sum_h = 0;
+  uint64_t sum_v = 0;
+  void add(uint64_t nonce, uint64_t v) {
+    ++n;
+    sum_h = addmod(sum_h, h_of(nonce));
+    sum_v = addmod(sum_v, v);
+  }
+  void reset() { n = sum_h = sum_v = 0; }
+};
+
+// ---------------------------------------------------------------- 重放窗口
+// 定长窗口记录最近见过的 nonce；see() 返回 false 表示重放。
+// CFMV 的聚合是可加的，重放一个合法包能同时加大三元组 —— 因此流级判定
+// 必须配合 nonce 窗口去重才安全。
+class NonceWindow {
+ public:
+  explicit NonceWindow(size_t capacity = 4096) : ring_(capacity) {}
+  // 首次出现返回 true；窗口内的重复返回 false。
+  bool see(uint64_t nonce);
+
+ private:
+  std::vector<uint64_t> ring_;
+  size_t head_ = 0;
 };
 
 }  // namespace mpv

@@ -237,5 +237,87 @@ int main(int argc, char** argv) {
     }
     std::printf("| %-2u | %8.3f | %9.3f |\n", k, median(tt), median(ts));
   }
+
+  // ------------------------------------------------- 多候选攻击矩阵（M3）
+  std::printf("\n多候选集下的攻击检出（k 条合法路径共用一张期望表）\n");
+  std::printf("| k  | 诚实接受          | 篡改检出          |\n");
+  std::printf("| -- | ----------------- | ----------------- |\n");
+  for (uint32_t k : {2u, 8u, 16u}) {
+    // k 条互异候选路径（三元组周期 42 > 16，且 sid ≤ 15 不越界）
+    std::vector<Path> cands;
+    for (uint32_t i = 0; i < k; ++i) {
+      Path p;
+      p.push_back(Hop{1, 1, 2});
+      p.push_back(Hop{2 + (i % 14), 1, 2});
+      p.push_back(Hop{9 + (i % 7), 1, 3});
+      p.push_back(Hop{13 + (i % 3), 1, 2});
+      p.push_back(Hop{16, 1, 2});
+      cands.push_back(p);
+    }
+    ExpectationTable tb(kr, cands);
+    int honest = 0, honest_total = 0, det = 0, det_total = 0;
+    for (int t = 0; t < trials; ++t) {
+      uint32_t pick = rng.range(0, k - 1);
+      uint64_t nonce = rng.nonce();
+      Header h = forward(kr, cands[pick], (uint8_t)pick, nonce);
+      ++honest_total;
+      if (tb.verify_tag(h).ok) ++honest;
+      Path bad = cands[pick];
+      uint32_t hi = rng.range(1, 3);
+      bad[hi].out_port = (bad[hi].out_port % 3) + 1;
+      if (!(bad == cands[pick])) {
+        ++det_total;
+        Header bh = forward(kr, bad, (uint8_t)pick, nonce);
+        if (!tb.verify_tag(bh).ok && tb.verify_scan(bh).matched < 0) ++det;
+      }
+    }
+    std::printf("| %-2u | %5.1f%% (%d/%d) | %5.1f%% (%d/%d) |\n", k,
+                100.0 * honest / honest_total, honest, honest_total,
+                100.0 * det / (det_total ? det_total : 1), det, det_total);
+  }
+
+  // ------------------------------------------------- 流级判定与 N 无关（CFMV）
+  std::printf("\n流级（CFMV）判定时延与窗口大小 N 的关系（k=16）\n");
+  std::printf("| N    | flow (us) |\n| ---- | --------- |\n");
+  {
+    std::vector<Path> cands;
+    for (uint32_t i = 0; i < 16; ++i) {
+      Path p;
+      p.push_back(Hop{1, 1, 2});
+      p.push_back(Hop{2 + (i % 14), 1, 2});
+      p.push_back(Hop{9 + (i % 7), 1, 3});
+      p.push_back(Hop{16, 1, 2});
+      cands.push_back(p);
+    }
+    ExpectationTable tb(kr, cands);
+    for (uint64_t n : {1ull, 32ull, 512ull, 4096ull}) {
+      FlowAgg agg;
+      for (uint64_t i = 0; i < n; ++i) {
+        Header h = forward(kr, cands[0], 0, 100 + i);
+        agg.add(h.nonce, h.acc);
+      }
+      std::vector<double> tv;
+      for (int i = 0; i < 2000; ++i) {
+        double t0 = now_us();
+        tb.verify_flow(0, agg.n, agg.sum_h, agg.sum_v);
+        tv.push_back(now_us() - t0);
+      }
+      std::printf("| %-4llu | %9.3f |\n", (unsigned long long)n, median(tv));
+    }
+  }
+
+  // ------------------------------------------------- 与已有方案对比（解析口径）
+  // 依据各方案公开设计推算，非复现实验；用于论文与演示的口径对齐。
+  std::printf("\n与已有路径验证方案对比（解析口径，h=跳数，k=候选路径数，N=窗口包数）\n");
+  std::printf("| 方案 | 验证头 | 控制器判定/包 | 多路径 | 交换机存储/流 | 覆盖率 |\n");
+  std::printf("| ---- | ------ | -------------- | ------ | -------------- | ------ |\n");
+  std::printf("| Icing | ≈4h B（随跳数线性） | O(h) 次逐跳校验 | 不支持 | O(h) | 逐包全采样 |\n");
+  std::printf("| L-PVS | 定长 ≈16 B | O(k)（需逐候选） | 需枚举候选 | O(k) | 逐包全采样 |\n");
+  std::printf("| Atlas | 小（概率标记） | O(1)（仅被采样包） | 支持 | O(1) | 采样 s，漏检 1-s |\n");
+  std::printf("| BPMV（本文） | 16 B 恒定 | O(k) scan | 支持 | O(1) | 逐包全采样 |\n");
+  std::printf("| CPMV（本文） | 16 B 恒定 | O(1) tag | 支持 | O(1) | 逐包全采样 |\n");
+  std::printf("| CFMV（本文） | 16 B 恒定 | O(1)/窗口 | 支持 | O(1)/流 | 窗口全采样+nonce 去重 |\n");
+  std::printf("\n注：CFMV 的流级判定必须配合 nonce 重放窗口（否则重放合法包可同时\n");
+  std::printf("抬高三元组），工程实现见 vswitch --flow-window 与控制器 NonceWindow。\n");
   return 0;
 }

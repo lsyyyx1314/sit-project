@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "mpv2.h"
+#include "controller.h"
 
 using namespace mpv;
 
@@ -209,6 +210,149 @@ static void functional_tests() {
   CHECK_EQ(detected, counted, "随机篡改检出率 100%");
 }
 
+// ---------------------------------------------------------------------------
+// CFMV 流级压缩 + 重放窗口
+// ---------------------------------------------------------------------------
+
+static void flow_tests() {
+  KeyRing kr = KeyRing::generate(16, 4, 0xF10A5);
+  Path p = make_path({1, 6, 11, 16});
+  std::vector<Path> cands{p, make_path({1, 7, 12, 16})};
+  ExpectationTable tb(kr, cands);
+
+  // N 包聚合后一次判定通过，且窗口内每个包逐包判定也通过
+  FlowAgg agg;
+  for (uint64_t i = 0; i < 50; ++i) {
+    Header h = forward(kr, p, 0, 1000 + i);
+    agg.add(h.nonce, h.acc);
+    CHECK(tb.verify_tag(h).ok, "流内单包逐包判定应通过");
+  }
+  Verdict v = tb.verify_flow(0, agg.n, agg.sum_h, agg.sum_v);
+  CHECK(v.ok, "流级聚合判定通过");
+  CHECK_EQ(v.checks, 1, "流级判定检查次数为 1");
+
+  // 线性恒等式：ΣV == N·A + B·Σh（CFMV 的数学根基）
+  Expectation e = expectation(kr, p);
+  CHECK_EQ(addmod(mulmod(agg.n % P, e.A), mulmod(e.B, agg.sum_h)), agg.sum_v,
+           "CFMV 线性恒等式 ΣV = N·A + B·Σh");
+
+  // 聚合域篡改：动任何一个分量都会破坏恒等式
+  FlowAgg bad = agg;
+  bad.sum_v = addmod(bad.sum_v, 1);
+  CHECK(!tb.verify_flow(0, bad.n, bad.sum_h, bad.sum_v).ok, "聚合 sum_v 篡改被拒");
+  FlowAgg bad2 = agg;
+  bad2.sum_h = addmod(bad2.sum_h, 7);
+  CHECK(!tb.verify_flow(0, bad2.n, bad2.sum_h, bad2.sum_v).ok, "聚合 sum_h 篡改被拒");
+  CHECK(!tb.verify_flow(0, agg.n + 1, agg.sum_h, agg.sum_v).ok, "窗口包数篡改被拒");
+  CHECK(!tb.verify_flow(1, agg.n, agg.sum_h, agg.sum_v).ok, "流级误配候选被拒");
+
+  // 大窗口（512 包）仍然一次判定
+  FlowAgg big;
+  for (uint64_t i = 0; i < 512; ++i) {
+    Header h = forward(kr, p, 0, 5000 + i);
+    big.add(h.nonce, h.acc);
+  }
+  CHECK(tb.verify_flow(0, big.n, big.sum_h, big.sum_v).ok,
+        "512 包窗口一次判定通过");
+
+  // 重放窗口
+  NonceWindow w(64);
+  CHECK(w.see(12345), "新 nonce 接受");
+  CHECK(!w.see(12345), "重复 nonce 拒绝");
+  bool all_new = true;
+  for (uint64_t i = 0; i < 63; ++i) all_new = all_new && w.see(700 + i);
+  CHECK(all_new, "窗口未满时新 nonce 全部接受");
+  CHECK(!w.see(12345), "未滑出窗口的重复仍被拒绝");
+}
+
+// ---------------------------------------------------------------------------
+// 控制器：上报解析、重放拦截、取证定位
+// ---------------------------------------------------------------------------
+
+static void controller_tests() {
+  const char* MAC = "aa:aa:aa:aa:aa:01";
+  Path p0 = make_path({1, 2, 3, 4});
+  Path p1 = make_path({1, 5, 3, 4});
+  std::vector<Direction> dirs{{MAC, {p0, p1}}};
+  const uint64_t SEED = 999;
+  KeyRing kr = KeyRing::generate(16, 4, SEED);
+  Controller ctl(SEED, dirs);
+
+  // 诚实包：先取证后上报（与真实时序一致）
+  Header h = forward(kr, p0, 0, 777);
+  char line[160];
+  uint64_t hh = h_of(777);
+  uint64_t e = 0;
+  for (size_t j = 0; j < p0.size(); ++j) {
+    e = addmod(e, mulmod(contribution(kr, p0[j], hh), powmod(RHO, (uint64_t)j)));
+    std::snprintf(line, sizeof(line), "TRACE %s %u 1 2 0 777 %zu %llu", MAC,
+                  p0[j].sid, j + 1, (unsigned long long)e);
+    ctl.feed(line);
+  }
+  std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
+                (unsigned long long)h.nonce, (unsigned long long)h.acc, MAC);
+  Event ev = ctl.feed(line);
+  CHECK(ev.kind == "packet" && ev.ok, "控制器判定诚实包通过");
+  CHECK_EQ(ev.suspect_sid, -1, "诚实包无嫌疑交换机");
+
+  // 重放同一行 → nonce 窗口拦截
+  ev = ctl.feed(line);
+  CHECK(ev.replay, "重放被 nonce 窗口拦截");
+
+  // 中间篡改：s2 翻转 1 比特 → 取证定位 s2
+  Header bad = forward(kr, p0, 0, 888);
+  bad.acc ^= 1;
+  uint64_t h8 = h_of(888);
+  uint64_t e1 = contribution(kr, p0[0], h8);
+  uint64_t e2 = addmod(e1, mulmod(contribution(kr, p0[1], h8), RHO));
+  std::snprintf(line, sizeof(line), "TRACE %s 1 1 2 0 888 1 %llu", MAC,
+                (unsigned long long)e1);
+  ctl.feed(line);
+  std::snprintf(line, sizeof(line), "TRACE %s 2 1 3 0 888 2 %llu", MAC,
+                (unsigned long long)(e2 ^ 1));
+  ctl.feed(line);
+  std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
+                (unsigned long long)bad.nonce, (unsigned long long)bad.acc, MAC);
+  ev = ctl.feed(line);
+  CHECK(!ev.ok, "中间篡改包被拒");
+  CHECK_EQ(ev.suspect_sid, 2, "取证定位到 s2");
+
+  // 出口上报篡改：各跳取证全部正常但最终上报被改 → 定位到出口 s4
+  Header fine = forward(kr, p0, 0, 999);
+  hh = h_of(999);
+  e = 0;
+  for (size_t j = 0; j < p0.size(); ++j) {
+    e = addmod(e, mulmod(contribution(kr, p0[j], hh), powmod(RHO, (uint64_t)j)));
+    std::snprintf(line, sizeof(line), "TRACE %s %u 1 2 0 999 %zu %llu", MAC,
+                  p0[j].sid, j + 1, (unsigned long long)e);
+    ctl.feed(line);
+  }
+  std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
+                (unsigned long long)fine.nonce,
+                (unsigned long long)(fine.acc ^ 2), MAC);
+  ev = ctl.feed(line);
+  CHECK(!ev.ok, "出口上报篡改被拒");
+  CHECK_EQ(ev.suspect_sid, 4, "取证定位到出口 s4");
+
+  // 流级：F L O W 行一次判定
+  FlowAgg agg;
+  for (uint64_t i = 0; i < 10; ++i) {
+    Header x = forward(kr, p0, 0, 2000 + i);
+    agg.add(x.nonce, x.acc);
+    char pl[160];
+    std::snprintf(pl, sizeof(pl), "1 0 %llu %llu %s",
+                  (unsigned long long)x.nonce, (unsigned long long)x.acc, MAC);
+    ctl.feed(pl);
+  }
+  std::snprintf(line, sizeof(line), "FLOW %s 0 %llu %llu %llu", MAC,
+                (unsigned long long)agg.n, (unsigned long long)agg.sum_h,
+                (unsigned long long)agg.sum_v);
+  ev = ctl.feed(line);
+  CHECK(ev.kind == "flow" && ev.ok, "FLOW 行流级判定通过");
+  const DirStat& st = ctl.stat(0);
+  CHECK_EQ(st.cfmv_checks, 1, "流级判定仅 1 次");
+}
+
 int main(int argc, char** argv) {
   const char* golden = (argc > 1) ? argv[1] : "../results/golden_vectors.txt";
 
@@ -221,6 +365,16 @@ int main(int argc, char** argv) {
   int before = g_pass;
   std::printf("== 2. 功能与对抗断言 ==\n");
   functional_tests();
+  std::printf("   新增 %d 项\n", g_pass - before);
+
+  before = g_pass;
+  std::printf("== 3. CFMV 流级压缩与重放窗口 ==\n");
+  flow_tests();
+  std::printf("   新增 %d 项\n", g_pass - before);
+
+  before = g_pass;
+  std::printf("== 4. 控制器判定与取证定位 ==\n");
+  controller_tests();
   std::printf("   新增 %d 项\n", g_pass - before);
 
   std::printf("\n结果：通过 %d，失败 %d\n", g_pass, g_fail);

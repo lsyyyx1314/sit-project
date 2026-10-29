@@ -13,10 +13,20 @@
 //
 // 上报（出口交换机，每包一行）：
 //     <sid> <tag> <nonce> <acc> <dst_mac>
+// 流级聚合上报（出口交换机，每凑满 --flow-window 包一行，CFMV）：
+//     FLOW <dst_mac> <tag> <N> <sum_h> <sum_v>
+//
+// 逐跳取证（--trace 开启时，每跳一行，供控制器定位首分歧交换机）：
+//     TRACE <dst_mac> <sid> <in> <out> <tag> <nonce> <pos> <V_after>
+//
+// 恶意交换机模拟（--evil）：
+//     bitflip 转发时翻转验证头 acc 的 1 个比特（伪造/篡改）
+//     dup     把带验证头的帧原样重发一份（重放攻击）
 //
 // 用法：
 //     vswitch --sid 1 --seed 20260501 --table s1.tbl --report rep.txt
 //             --paths 2 --force-tag 0 --port 1:s1p1 --port 2:s1p2
+//             [--trace trace.txt] [--flow-window 32] [--evil bitflip]
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
@@ -65,30 +75,57 @@ struct Port {
   int ifindex = 0;
 };
 
+struct PairHash {
+  size_t operator()(const std::pair<std::string, std::string>& p) const {
+    return std::hash<std::string>()(p.first) ^
+           (std::hash<std::string>()(p.second) << 1);
+  }
+};
+
+enum class Evil { kNone, kBitflip, kDup };
+
 class VSwitch {
  public:
   VSwitch(uint32_t sid, uint64_t seed, std::string table, std::string report,
-          std::vector<Port> ports, int paths, int force_tag)
+          std::vector<Port> ports, int paths, int force_tag, Evil evil,
+          std::string trace_path, uint32_t flow_window)
       : kr_(KeyRing::generate(16, 4, seed)),
         sid_(sid),
         table_path_(std::move(table)),
         report_path_(std::move(report)),
         ports_(std::move(ports)),
         paths_(paths),
-        force_tag_(force_tag) {
+        force_tag_(force_tag),
+        evil_(evil),
+        flow_window_(flow_window) {
     for (const Port& p : ports_) {
       fd_by_port_[p.index] = p.fd;
       ifindex_by_port_[p.index] = p.ifindex;
     }
     report_ = std::fopen(report_path_.c_str(), "a");
+    if (!trace_path.empty()) trace_ = std::fopen(trace_path.c_str(), "a");
     load_table(true);
   }
 
   void stats() const {
     if (!debug_) return;
-    std::fprintf(stderr, "[s%u] in=%llu out=%llu drop=%llu entries=%zu\n", sid_,
-                 (unsigned long long)in_, (unsigned long long)out_,
-                 (unsigned long long)drop_, entries_.size());
+    std::fprintf(stderr,
+                 "[s%u] in=%llu out=%llu drop=%llu entries=%zu flows=%zu\n",
+                 sid_, (unsigned long long)in_, (unsigned long long)out_,
+                 (unsigned long long)drop_, entries_.size(), flows_.size());
+  }
+
+  // 把未凑满窗口的流级聚合冲进上报文件（退出前调用）
+  void flush_flows() {
+    for (auto& kv : flows_) {
+      FlowAgg& a = kv.second;
+      if (a.n == 0) continue;
+      std::fprintf(report_, "FLOW %s %s %llu %llu %llu\n", kv.first.first.c_str(),
+                   kv.first.second.c_str(), (unsigned long long)a.n,
+                   (unsigned long long)a.sum_h, (unsigned long long)a.sum_v);
+      a.reset();
+    }
+    std::fflush(report_);
   }
 
   void set_debug(bool v) { debug_ = v; }
@@ -215,6 +252,9 @@ class VSwitch {
       acc = addmod(acc, mulmod(c, powmod(RHO, (uint64_t)e->pos - 1)));
     }
 
+    // 恶意交换机：篡改验证头（在本跳的合法贡献之后叠加比特翻转）
+    if (evil_ == Evil::kBitflip && shimmed) acc ^= 1;
+
     int out_fd = fd_by_port_[e->port];
     if (out_fd < 0) return;
 
@@ -235,17 +275,42 @@ class VSwitch {
     dst_addr.sll_ifindex = ifindex_by_port_[e->port];
     dst_addr.sll_halen = 6;
     std::memcpy(dst_addr.sll_addr, out, 6);
-    if (::sendto(out_fd, out, off + payload_len, 0,
-                 reinterpret_cast<sockaddr*>(&dst_addr), sizeof(dst_addr)) > 0)
+    ssize_t sent = ::sendto(out_fd, out, off + payload_len, 0,
+                            reinterpret_cast<sockaddr*>(&dst_addr),
+                            sizeof(dst_addr));
+    if (sent > 0)
       ++out_;
     else
       std::fprintf(stderr, "[s%u] sendto 失败: %s\n", sid_, std::strerror(errno));
+
+    // 恶意交换机：重放（把带验证头的帧原样再发一份）
+    if (evil_ == Evil::kDup && shimmed && sent > 0)
+      ::sendto(out_fd, out, off + payload_len, 0,
+               reinterpret_cast<sockaddr*>(&dst_addr), sizeof(dst_addr));
+
+    // 逐跳取证：记录本跳之后实际写进帧里的累加值
+    if (trace_) {
+      std::fprintf(trace_, "TRACE %s %u %u %u %u %llu %u %llu\n", dst.c_str(),
+                   sid_, hop.in_port, e->port, tag,
+                   (unsigned long long)nonce, e->pos,
+                   (unsigned long long)acc);
+      std::fflush(trace_);
+    }
 
     if (e->strip) {
       std::fprintf(report_, "%u %u %llu %llu %s\n", sid_, tag,
                    (unsigned long long)nonce, (unsigned long long)acc,
                    dst.c_str());
       std::fflush(report_);
+      // CFMV：按 (流, tag) 聚合，凑满一个窗口上报一行
+      FlowAgg& a = flows_[{dst, std::to_string(tag)}];
+      a.add(nonce, acc);
+      if (a.n >= flow_window_) {
+        std::fprintf(report_, "FLOW %s %u %llu %llu %llu\n", dst.c_str(), tag,
+                     (unsigned long long)a.n, (unsigned long long)a.sum_h,
+                     (unsigned long long)a.sum_v);
+        a.reset();
+      }
     }
     (void)src;
   }
@@ -257,11 +322,16 @@ class VSwitch {
   std::vector<Port> ports_;
   int paths_;
   int force_tag_;
+  Evil evil_ = Evil::kNone;
+  uint32_t flow_window_ = 32;
+  std::unordered_map<std::pair<std::string, std::string>, FlowAgg, PairHash>
+      flows_;
   std::unordered_map<std::string, Entry> entries_;
   std::unordered_map<int, int> fd_by_port_;
   std::unordered_map<int, int> ifindex_by_port_;
   time_t mtime_ = 0;
   std::FILE* report_ = nullptr;
+  std::FILE* trace_ = nullptr;
   uint64_t in_ = 0, out_ = 0, drop_ = 0;
   bool debug_ = false;
 };
@@ -292,7 +362,10 @@ int open_port(const std::string& name) {
 VSwitch* g_sw = nullptr;
 
 void on_term(int) {
-  if (g_sw) g_sw->stats();
+  if (g_sw) {
+    g_sw->flush_flows();
+    g_sw->stats();
+  }
   std::_Exit(0);
 }
 
@@ -302,8 +375,9 @@ int main(int argc, char** argv) {
   uint32_t sid = 0;
   uint64_t seed = 0;
   bool debug = false;
-  std::string table, report;
+  std::string table, report, trace, evil = "none";
   int paths = 1, force_tag = -1;
+  uint32_t flow_window = 32;
   std::vector<Port> ports;
 
   for (int i = 1; i < argc; ++i) {
@@ -313,8 +387,11 @@ int main(int argc, char** argv) {
     else if (a == "--seed") seed = std::stoull(next());
     else if (a == "--table") table = next();
     else if (a == "--report") report = next();
+    else if (a == "--trace") trace = next();
     else if (a == "--paths") paths = std::stoi(next());
     else if (a == "--force-tag") force_tag = std::stoi(next());
+    else if (a == "--flow-window") flow_window = (uint32_t)std::stoul(next());
+    else if (a == "--evil") evil = next();
     else if (a == "--debug") debug = true;
     else if (a == "--port") {
       std::string spec = next();
@@ -332,9 +409,17 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "至少需要一个 --port\n");
     return 1;
   }
+  Evil emode = Evil::kNone;
+  if (evil == "bitflip") emode = Evil::kBitflip;
+  else if (evil == "dup") emode = Evil::kDup;
+  else if (evil != "none") {
+    std::fprintf(stderr, "未知 --evil：%s（none|bitflip|dup）\n", evil.c_str());
+    return 2;
+  }
 
   std::srand((unsigned)(seed ^ (sid * 2654435761u)));
-  VSwitch sw(sid, seed, table, report, std::move(ports), paths, force_tag);
+  VSwitch sw(sid, seed, table, report, std::move(ports), paths, force_tag,
+             emode, trace, flow_window);
   sw.set_debug(debug);
   g_sw = &sw;
   std::signal(SIGTERM, on_term);

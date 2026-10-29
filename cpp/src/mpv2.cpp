@@ -185,4 +185,51 @@ Verdict ExpectationTable::verify_scan(const Header& hdr) const {
   return v;
 }
 
+// ---------------------------------------------------------------- CFMV
+// 判定式：N·A_P + B_P·Σh ≡ ΣV (mod p)
+// 来源：Σ_i (A + B·h_i) = N·A + B·Σh，线性性把 N 次逐包判定压成 1 次。
+Verdict ExpectationTable::verify_flow(uint8_t tag, uint64_t n, uint64_t sum_h,
+                                      uint64_t sum_v) const {
+  Verdict v;
+  if (tag >= table_.size() || n == 0) return v;
+  v.checks = 1;
+  const Expectation& e = table_[tag];
+  uint64_t lhs = addmod(mulmod(n % P, e.A), mulmod(e.B, sum_h));
+  if (lhs == sum_v) {
+    v.ok = true;
+    v.matched = tag;
+  }
+  return v;
+}
+
+Verdict ExpectationTable::verify_flow_scan(uint64_t n, uint64_t sum_h,
+                                           uint64_t sum_v) const {
+  Verdict v;
+  if (n == 0) return v;
+  for (size_t i = 0; i < table_.size(); ++i) {
+    v.checks = static_cast<int>(i + 1);
+    const Expectation& e = table_[i];
+    uint64_t lhs = addmod(mulmod(n % P, e.A), mulmod(e.B, sum_h));
+    if (lhs == sum_v) {
+      v.ok = true;
+      v.matched = static_cast<int>(i);
+      return v;
+    }
+  }
+  return v;
+}
+
+// ---------------------------------------------------------------- 重放窗口
+// 环形缓冲线性扫描：容量 4096、包速率 ≤ 10^5/s 时，平均扫描 ~2000 次比较，
+// 远小于一次 blake2b；不需要哈希表。
+bool NonceWindow::see(uint64_t nonce) {
+  for (size_t i = 0; i < ring_.size(); ++i) {
+    size_t idx = (head_ + i) % ring_.size();
+    if (ring_[idx] == nonce && ring_[idx] != 0) return false;
+  }
+  ring_[head_] = nonce;
+  head_ = (head_ + 1) % ring_.size();
+  return true;
+}
+
 }  // namespace mpv
