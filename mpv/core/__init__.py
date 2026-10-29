@@ -5,6 +5,7 @@ from .header import Header, forward, hop_update, ingress_init
 from .keys import Hop, KeyRing, Switch
 from .pathset import PathSet
 from .verify import Verdict, recompute_tag, verify_cached, verify_candidates, verify_path
+from . import scheme
 
 __all__ = [
     "HEADER_BYTES",
@@ -24,4 +25,5 @@ __all__ = [
     "verify_path",
     "verify_candidates",
     "verify_cached",
+    "scheme",
 ]
