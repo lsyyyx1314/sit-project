@@ -7,3 +7,4 @@ logs/
 .workbuddy/
 tools/vm/.vm_pass
 .DS_Store
+dist/
