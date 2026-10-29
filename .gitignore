@@ -8,3 +8,4 @@ logs/
 tools/vm/.vm_pass
 .DS_Store
 dist/
+tools/

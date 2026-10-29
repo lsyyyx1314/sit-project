@@ -1,8 +1,0 @@
-# 顶层依赖（精确版本见 docs/env.lock.txt）
-os-ken>=4.2,<5
-networkx>=3.3
-scapy>=2.6
-matplotlib>=3.9
-pandas>=2.2
-numpy>=2.0
-pytest>=8.0

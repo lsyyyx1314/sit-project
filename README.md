@@ -1,6 +1,10 @@
 # SIT — 面向软件定义网络的高效多路径验证研究
 
-大学生创新创业训练计划（创新训练项目）原型。实现语言 **C++17，零外部依赖**。
+大学生创新创业训练计划（创新训练项目）原型。
+
+**实现语言：C++17，工程内没有任何脚本语言代码**（无 Python、无 Shell）。
+依赖只有一个 C++ 编译器与 make；拓扑用 iproute2 的 `ip` 命令搭建，交换机与验证器
+全部是本工程编译出的可执行文件。
 
 把「验证一条固定路径」扩展为「验证一个合法路径集合」：数据包逐跳维护 16 字节定长
 验证头，出口上报控制器，控制器据此判定路径合法性，并在失败时定位到分歧交换机。
@@ -12,7 +16,8 @@
 ## 快速开始
 
 ```bash
-make            # 编译（g++ >= 11）
+make deps       # 安装 g++ / make / iproute2（已装则跳过）
+make            # 编译 5 个可执行文件
 make test       # 黄金向量交叉校验 + 功能/对抗断言
 make bench      # 攻击矩阵与性能基准
 sudo make e2e   # 端到端：4 台软件交换机，双向双路径
@@ -23,12 +28,19 @@ sudo make e2e   # 端到端：4 台软件交换机，双向双路径
 | 路径 | 内容 |
 |---|---|
 | `cpp/include/` | `blake2b.h`（RFC 7693）、`mpv2.h`（算法接口） |
-| `cpp/src/` | `blake2b.cpp`、`mpv2.cpp`、`vswitch.cpp`（软件交换机）、`verify_reports.cpp`、`bench.cpp` |
-| `cpp/tests/` | `test_mpv2.cpp`、`golden_vectors.txt`（与 Python 参考实现逐位一致的夹具） |
-| `cpp/scripts/` | `e2e.sh`（netns + veth + 4 交换机） |
-| `scripts/` | `provision.sh` 环境供给 |
-| `docs/` | 计划书、算法报告 |
-| `legacy/python-ref/` | 停用的 Python 参考实现，仅用于生成黄金向量 |
+| `cpp/src/` | `blake2b.cpp`、`mpv2.cpp`、`vswitch.cpp`、`verify_reports.cpp`、`bench.cpp`、`e2e.cpp` |
+| `cpp/tests/` | `test_mpv2.cpp`、`golden_vectors.txt`（冻结的交叉校验夹具） |
+| `docs/` | 计划书、算法设计与验证报告 |
+
+## 可执行文件
+
+| 程序 | 作用 |
+|---|---|
+| `tests` | 黄金向量比对 + 功能/对抗断言 |
+| `vswitch` | 软件虚拟交换机（AF_PACKET，逐跳更新验证头） |
+| `verify_reports` | 读交换机上报，判定并定位分歧点 |
+| `bench` | 10 类攻击矩阵 + 判定时延 |
+| `e2e` | 端到端编排：建拓扑、跑两轮、出结论 |
 
 ## 核心设计
 
@@ -49,7 +61,7 @@ E(P) = A_P + B_P·h               控制器期望值（与 nonce 无关，可预
 
 | 项 | 结果 |
 |---|---|
-| 黄金向量交叉校验（C++ vs Python 参考） | 612 项逐位一致，0 失败 |
+| 黄金向量交叉校验 | 612 项逐位一致，0 失败 |
 | 10 类攻击检出率（各 3000 次） | 100%（申报书原式为 0%） |
 | 诚实样本接受率 | 100% |
 | 控制器判定 k=64 | 0.27 µs（tag）/ 0.60 µs（scan） |
