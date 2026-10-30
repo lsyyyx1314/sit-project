@@ -36,7 +36,8 @@ struct Event {
   bool replay = false;   // nonce 窗口判定为重放
   int matched = -1;      // 实际命中的候选编号（scan 结果）
   int claimed = -1;      // 包声称的 tag（flow 为上报 tag）
-  int suspect_sid = -1;  // 定位到的嫌疑交换机
+  int suspect_sid = -1;  // 首个嫌疑交换机（= suspects 的第一个）
+  std::vector<int> suspects;  // 多故障定位：全部嫌疑交换机
   double verify_us = 0;  // 本次判定耗时（微秒）
 };
 
@@ -64,6 +65,11 @@ class Controller {
   // 定位：优先逐跳取证（首个 V ≠ 期望前缀的交换机 / 最后取证点的下一跳），
   // 其次候选对比（声称路径与实际命中路径的首个分歧点）。返回嫌疑 sid 或 -1。
   int localize(size_t dir, uint8_t tag, uint64_t nonce, uint64_t acc);
+
+  // 多故障定位：沿实际取证路由逐跳对照累计期望与声称路径位置，
+  // 返回全部嫌疑交换机（改道跳 + 每个篡改跳）。无取证时退化为单点定位。
+  std::vector<int> localize_all(size_t dir, uint8_t tag, uint64_t nonce,
+                                uint64_t acc);
 
  private:
   int dir_of(const std::string& mac) const;

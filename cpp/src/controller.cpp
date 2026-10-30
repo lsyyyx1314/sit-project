@@ -1,5 +1,6 @@
 #include "controller.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <sstream>
@@ -89,8 +90,11 @@ Event Controller::feed_packet(std::istringstream& ss) {
   }
   ++st.fail;
   ev.matched = sc.matched;
-  ev.suspect_sid = localize((size_t)d, (uint8_t)tag, nonce, acc);
-  if (ev.suspect_sid >= 0) ++st.localized;
+  ev.suspects = localize_all((size_t)d, (uint8_t)tag, nonce, acc);
+  if (!ev.suspects.empty()) {
+    ev.suspect_sid = ev.suspects.front();
+    ++st.localized;
+  }
   return ev;
 }
 
@@ -147,38 +151,82 @@ Event Controller::feed_trace(std::istringstream& ss) {
 
 int Controller::localize(size_t dir, uint8_t tag, uint64_t nonce,
                          uint64_t acc) {
-  if (dir >= dirs_.size()) return -1;
+  std::vector<int> s = localize_all(dir, tag, nonce, acc);
+  return s.empty() ? -1 : s.front();
+}
+
+// 多故障定位：沿实际取证路由逐跳对照。
+//   * 篡改检查：期望值用「上一跳的观测值」做基准（篡改偏移 δ 会随帧传播，
+//     用纯净累计值会把下游诚实交换机也误标为嫌疑）；
+//   * 位置检查：取证的实际 (sid,in,out) 与声称路径第 i 跳不一致 → 改道/改端口
+//     嫌疑 = 声称路径的第 i 跳交换机；
+//   * 取证覆盖全程但最终上报仍不符 → 出口上报篡改。
+std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
+                                          uint64_t nonce, uint64_t acc) {
+  std::vector<int> out;
+  if (dir >= dirs_.size()) return out;
   const Path& claimed = dirs_[dir].paths[tag];
   const std::string key = dirs_[dir].mac + "|" + std::to_string(nonce);
   auto it = traces_.find(key);
 
   uint64_t hh = h_of(nonce);
-  if (it != traces_.end() && !it->second.empty()) {
-    // 逐跳对照：E_j = Σ_{i≤j} c_i·ρ^(i-1)，与各跳取证值比对
-    uint64_t expect = 0;
-    for (size_t j = 0; j < claimed.size(); ++j) {
-      uint64_t c = contribution(kr_, claimed[j], hh);
-      expect = addmod(expect, mulmod(c, powmod(RHO, (uint64_t)j)));
-      const HopTrace* rec = nullptr;
-      for (const HopTrace& r : it->second)
-        if (r.sid == claimed[j].sid) rec = &r;  // 取该交换机的最后一条
-      if (!rec) return (int)claimed[j].sid;     // 包没能到达该跳：嫌疑 = 该跳
-      if (rec->v_after != expect) return (int)claimed[j].sid;  // 本跳起对不上
-    }
-    if (acc != expect) return (int)claimed.back().sid;  // 出口上报与取证不符
-    return -1;
+  if (it == traces_.end() || it->second.empty()) {
+    // 无取证：候选对比，声称路径与实际命中路径的首个分歧交换机
+    ExpectationTable tb(kr_, dirs_[dir].paths);
+    Verdict sc = tb.verify_scan(Header{nonce, acc, tag});
+    if (sc.matched < 0) return out;
+    const Path& actual = dirs_[dir].paths[(size_t)sc.matched];
+    size_t common = 0;
+    while (common < claimed.size() && common < actual.size() &&
+           claimed[common].sid == actual[common].sid)
+      ++common;
+    out.push_back((int)claimed[common > 0 ? common - 1 : 0].sid);
+    return out;
   }
 
-  // 无取证时退化为候选对比：声称路径与实际命中路径的首个分歧交换机
-  ExpectationTable tb(kr_, dirs_[dir].paths);
-  Verdict sc = tb.verify_scan(Header{nonce, acc, tag});
-  if (sc.matched < 0) return -1;
-  const Path& actual = dirs_[dir].paths[(size_t)sc.matched];
-  size_t common = 0;
-  while (common < claimed.size() && common < actual.size() &&
-         claimed[common].sid == actual[common].sid)
-    ++common;
-  return (int)claimed[common > 0 ? common - 1 : 0].sid;
+  std::vector<HopTrace> recs = it->second;
+  std::stable_sort(recs.begin(), recs.end(),
+                   [](const HopTrace& a, const HopTrace& b) {
+                     return a.pos < b.pos;
+                   });
+
+  uint64_t carry = 0;      // 上一跳之后帧里的实际累加值
+  bool on_claimed = true;  // 尚未偏离声称路径
+  for (size_t i = 0; i < recs.size(); ++i) {
+    const HopTrace& r = recs[i];
+    Hop hop{r.sid, r.in_port, r.out_port};
+    uint64_t expect = addmod(carry, mulmod(contribution(kr_, hop, hh),
+                                           powmod(RHO, (uint64_t)i)));
+    if (r.v_after != expect) out.push_back((int)r.sid);  // 本跳篡改嫌疑
+    carry = r.v_after;  // 以观测值为准，让后续跳的期望建立在实际上
+
+    if (on_claimed) {
+      if (i < claimed.size() && r.sid == claimed[i].sid &&
+          r.in_port == claimed[i].in_port && r.out_port == claimed[i].out_port)
+        continue;
+      // 与声称路径第 i 跳不一致：改道/改端口发生在该跳
+      if (i < claimed.size()) out.push_back((int)claimed[i].sid);
+      on_claimed = false;
+    }
+  }
+
+  // 取证全程与声称路径吻合、无任何其他嫌疑，但出口上报仍不符：
+  // 出口上报本身被篡改。路由已偏离或已有篡改嫌疑时，上报值不等属于正常
+  // 推论，不得再把出口交换机标为嫌疑。
+  if (out.empty() && on_claimed && recs.size() == claimed.size()) {
+    uint64_t expect_total = 0;
+    for (size_t j = 0; j < claimed.size(); ++j)
+      expect_total =
+          addmod(expect_total, mulmod(contribution(kr_, claimed[j], hh),
+                                      powmod(RHO, (uint64_t)j)));
+    if (acc != expect_total) out.push_back((int)claimed.back().sid);
+  }
+
+  // 去重保序
+  std::vector<int> dedup;
+  for (int sid : out)
+    if (dedup.empty() || dedup.back() != sid) dedup.push_back(sid);
+  return dedup;
 }
 
 }  // namespace mpv

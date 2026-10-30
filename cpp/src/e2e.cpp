@@ -49,7 +49,8 @@ struct RoundResult {
 };
 
 std::vector<Event> run_round(const std::string& name, Scenario sc,
-                             const std::string& evil_s2, int pings,
+                             const std::string& evil_s2,
+                             const std::string& evil_s3, int pings,
                              Controller& ctl) {
   std::printf("\n== %s ==\n", name.c_str());
   std::fflush(stdout);
@@ -57,12 +58,13 @@ std::vector<Event> run_round(const std::string& name, Scenario sc,
   clear_logs();
   write_tables(sc);
   setup_links();
+  apply_link_state(sc);
 
   auto mk = [&](int sid, std::vector<std::string> ports) {
     SwitchConf c;
     c.sid = sid;
     c.ports = ports;
-    c.evil = (sid == 2) ? evil_s2 : "none";
+    c.evil = (sid == 2) ? evil_s2 : (sid == 3) ? evil_s3 : "none";
     return c;
   };
   std::vector<pid_t> pids;
@@ -137,7 +139,7 @@ int main() {
   ::mkdir(WORK, 0755);
 
   std::printf("================================================================\n");
-  std::printf("MPV-2 端到端验证 · C++ 软件交换机 4 台 · 五轮场景\n");
+  std::printf("MPV-2 端到端验证 · C++ 软件交换机 4 台 · 七轮场景\n");
   std::printf("================================================================\n");
 
   const int PINGS = 20;
@@ -146,7 +148,7 @@ int main() {
   // ------------------------------------------------------------ R1 正常
   {
     Controller ctl(SEED, directions());
-    auto evs = run_round("R1 正常转发", Scenario::kNormal, "none", PINGS, ctl);
+    auto evs = run_round("R1 正常转发", Scenario::kNormal, "none", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
     const DirStat& f = ctl.stat(0);
@@ -161,7 +163,7 @@ int main() {
   // ------------------------------------------------------------ R2 标签错配
   {
     Controller ctl(SEED, directions());
-    auto evs = run_round("R2 标签错配", Scenario::kTagflip, "none", PINGS, ctl);
+    auto evs = run_round("R2 标签错配", Scenario::kTagflip, "none", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
     const DirStat& f = ctl.stat(0);
@@ -177,7 +179,7 @@ int main() {
   {
     Controller ctl(SEED, directions());
     auto evs = run_round("R3 恶意交换机·比特翻转", Scenario::kNormal,
-                         "bitflip", PINGS, ctl);
+                         "bitflip", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
     const DirStat& f = ctl.stat(0);
@@ -194,7 +196,7 @@ int main() {
   {
     Controller ctl(SEED, directions());
     auto evs = run_round("R4 恶意交换机·重放", Scenario::kNormal, "dup",
-                         PINGS, ctl);
+                         "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
     const DirStat& f = ctl.stat(0);
@@ -207,7 +209,7 @@ int main() {
   // ------------------------------------------------------------ R5 流级压缩
   {
     Controller ctl(SEED, directions());
-    run_round("R5 流级压缩（CFMV）", Scenario::kNormal, "none", PINGS, ctl);
+    run_round("R5 流级压缩（CFMV）", Scenario::kNormal, "none", "none", PINGS, ctl);
     const DirStat& f = ctl.stat(0);
     const DirStat& r = ctl.stat(1);
     std::printf("  逐包判定（CPMV）%llu 次 vs 流级判定（CFMV）%llu 次\n",
@@ -218,6 +220,49 @@ int main() {
                                       f.cfmv_checks + r.cfmv_checks <
                                           f.cpmv_checks + r.cpmv_checks,
                             "流级判定应全过且判定次数显著少于逐包"));
+  }
+
+  // ------------------------------------------------------------ R6 链路故障切换
+  {
+    // s1–s2 链路物理 down，tag0 全网切到 P1 分支，控制器候选集收敛为 {P1}：
+    // 切换后验证继续全通过、零误报 —— 验证机制与重路由协同
+    Controller ctl(SEED, directions_for(Scenario::kFailover));
+    auto evs = run_round("R6 链路故障切换", Scenario::kFailover, "none", "none",
+                         PINGS, ctl);
+    print_dir("正向", 0, ctl);
+    print_dir("反向", 1, ctl);
+    const DirStat& f = ctl.stat(0);
+    const DirStat& r = ctl.stat(1);
+    results.push_back(check("R6", f.packets > 0 && f.fail == 0 && r.pass > 0 &&
+                                      r.fail == 0,
+                            "故障切换后流量应全部走 P1 且验证零误报"));
+    (void)evs;
+  }
+
+  // ------------------------------------------------------------ R7 多重故障
+  {
+    // 双故障：s1 标签错配（改道 P1）+ s3 比特翻转。定位应同时报出 {s1, s3}：
+    // s1 = 改道/改端口嫌疑（位置偏离），s3 = 篡改嫌疑（观测值偏离）
+    Controller ctl(SEED, directions());
+    auto evs = run_round("R7 多重故障（改道+改头）", Scenario::kTagflip, "none",
+                         "bitflip", PINGS, ctl);
+    print_dir("正向", 0, ctl);
+    print_dir("反向", 1, ctl);
+    const DirStat& f = ctl.stat(0);
+    const DirStat& r = ctl.stat(1);
+    // 汇总正向全部失败事件的嫌疑集合
+    bool has1 = false, has3 = false;
+    for (const Event& e : evs)
+      if (e.mac == directions()[0].mac && !e.ok && !e.replay)
+        for (int sid : e.suspects) {
+          if (sid == 1) has1 = true;
+          if (sid == 3) has3 = true;
+        }
+    std::printf("      → 定位：嫌疑集合 {%s%s}\n", has1 ? "s1" : "",
+                has1 && has3 ? ", s3" : has3 ? "s3" : "");
+    results.push_back(check("R7", f.packets > 0 && f.fail == f.packets &&
+                                      r.fail == 0 && has1 && has3,
+                            "双故障应全检出且同时定位 s1 与 s3，反向不受影响"));
   }
 
   // ------------------------------------------------------------ 汇总
@@ -234,6 +279,6 @@ int main() {
     std::printf("结论：%d 轮未通过\n", bad);
     return 1;
   }
-  std::printf("结论：R1–R5 全部通过 —— 端到端验证成立\n");
+  std::printf("结论：R1–R7 全部通过 —— 端到端验证成立\n");
   return 0;
 }

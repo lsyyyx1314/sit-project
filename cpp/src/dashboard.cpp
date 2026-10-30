@@ -46,6 +46,7 @@ struct EventView {
   std::string mac;
   std::string nonce_hex;
   int tag, matched, suspect;
+  std::vector<int> suspects;
   bool ok, replay, lost;
   std::string kind;  // packet | flow
   uint64_t n;
@@ -59,7 +60,8 @@ struct State {
   std::vector<DirStat> stats;                 // 每方向
   std::vector<double> us_sum{0.0, 0.0};       // 判定时延累计
   std::vector<uint64_t> us_cnt{0, 0};
-  int suspect = -1;                           // 最近一次定位
+  int suspect = -1;                           // 最近一次定位（首个嫌疑）
+  std::vector<int> suspects;                  // 多故障：当前全部嫌疑交换机
   int lost_count = 0;
   std::vector<int> lost_suspects;
   uint64_t traffic_packets = 0;               // 已触发 ping 数
@@ -97,17 +99,25 @@ double g_started = 0;
 std::vector<pid_t> g_pids;  // s1..s4
 std::string g_vswitch;
 
-const char* kScenarios[] = {"normal", "tagflip", "blackhole", "bitflip", "dup"};
+const char* kScenarios[] = {"normal", "tagflip", "blackhole", "bitflip", "dup",
+                            "failover", "multifault"};
 
 Scenario scenario_tables(const std::string& s) {
-  if (s == "tagflip") return Scenario::kTagflip;
+  if (s == "tagflip" || s == "multifault") return Scenario::kTagflip;
   if (s == "blackhole") return Scenario::kBlackhole;
+  if (s == "failover") return Scenario::kFailover;
   return Scenario::kNormal;
 }
 
-const char* scenario_evil(const std::string& s) {
+// 各场景的恶意交换机配置：bitflip/dup 在 s2；multifault 的改头在 s3
+const char* scenario_evil_s2(const std::string& s) {
   if (s == "bitflip") return "bitflip";
   if (s == "dup") return "dup";
+  return "none";
+}
+
+const char* scenario_evil_s3(const std::string& s) {
+  if (s == "multifault") return "bitflip";
   return "none";
 }
 
@@ -212,13 +222,19 @@ void handle_line(const std::string& line) {
   v.replay = ev.replay;
   v.matched = ev.matched;
   v.suspect = ev.suspect_sid;
+  v.suspects = ev.suspects;
   v.lost = false;
   v.kind = ev.kind;
   v.n = ev.n;
   v.us = ev.verify_us;
   g_state.us_sum[(size_t)d] += ev.verify_us;
   g_state.us_cnt[(size_t)d] += 1;
-  if (ev.suspect_sid >= 0) g_state.suspect = ev.suspect_sid;
+  if (ev.suspect_sid >= 0) {
+    g_state.suspect = ev.suspect_sid;
+    for (int sid : ev.suspects)
+      if (g_state.suspects.empty() || g_state.suspects.back() != sid)
+        g_state.suspects.push_back(sid);
+  }
   push_event(v);
 }
 
@@ -234,7 +250,7 @@ void tailer_loop() {
 }
 
 // ---------------------------------------------------------------- 交换机管理
-void start_switches(const std::string& evil_s2) {
+void start_switches(const std::string& evil_s2, const std::string& evil_s3) {
   auto mk = [&](int sid, std::vector<std::string> ports,
                 const std::string& evil) {
     SwitchConf c;
@@ -250,7 +266,7 @@ void start_switches(const std::string& evil_s2) {
   g_pids.push_back(
       spawn_switch(g_vswitch, mk(2, {"1:s2p1", "2:s2p2"}, evil_s2)));
   g_pids.push_back(
-      spawn_switch(g_vswitch, mk(3, {"1:s3p1", "2:s3p2"}, "none")));
+      spawn_switch(g_vswitch, mk(3, {"1:s3p1", "2:s3p2"}, evil_s3)));
   g_pids.push_back(spawn_switch(
       g_vswitch, mk(4, {"1:s4p1", "2:s4p2", "3:s4p3"}, "none")));
 }
@@ -267,12 +283,13 @@ void reset_run(const std::string& scenario) {
   g_tail_trace.close();
   clear_logs();
   delete g_ctl;
-  g_ctl = new Controller(SEED, directions());
+  g_ctl = new Controller(SEED, directions_for(scenario_tables(scenario)));
   g_state.stats.assign(2, DirStat{});
   g_state.us_sum.assign(2, 0.0);
   g_state.us_cnt.assign(2, 0);
   g_state.events.clear();
   g_state.suspect = -1;
+  g_state.suspects.clear();
   g_state.lost_count = 0;
   g_state.lost_suspects.clear();
   g_state.traced_h2.clear();
@@ -406,6 +423,12 @@ std::string json_state() {
   o << "{\"scenario\":\"" << esc(g_state.scenario) << "\"";
   o << ",\"uptime\":" << (mono_s() - g_started);
   o << ",\"suspect\":" << g_state.suspect;
+  o << ",\"suspects\":[";
+  for (size_t i = 0; i < g_state.suspects.size(); ++i) {
+    if (i) o << ",";
+    o << g_state.suspects[i];
+  }
+  o << "]";
   o << ",\"lost\":{\"count\":" << g_state.lost_count << ",\"suspects\":[";
   for (size_t i = 0; i < g_state.lost_suspects.size(); ++i) {
     if (i) o << ",";
@@ -438,6 +461,12 @@ std::string json_state() {
       << ",\"replay\":" << (e.replay ? "true" : "false")
       << ",\"lost\":" << (e.lost ? "true" : "false")
       << ",\"matched\":" << e.matched << ",\"suspect\":" << e.suspect
+      << ",\"suspects\":[";
+    for (size_t k = 0; k < e.suspects.size(); ++k) {
+      if (k) o << ",";
+      o << e.suspects[k];
+    }
+    o << "]"
       << ",\"us\":" << e.us << ",\"kind\":\"" << esc(e.kind) << "\""
       << ",\"n\":" << e.n << "}";
   }
@@ -468,7 +497,8 @@ std::string http_post(int, const std::string& path, const std::string& body) {
     stop_switches();
     reset_run(name);
     write_tables(scenario_tables(name));
-    start_switches(scenario_evil(name));
+    apply_link_state(scenario_tables(name));
+    start_switches(scenario_evil_s2(name), scenario_evil_s3(name));
     std::this_thread::sleep_for(std::chrono::milliseconds(700));  // 等表热加载
     return "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
   }
@@ -563,8 +593,10 @@ td{padding:4px 6px;border-bottom:1px solid #1a2440;font-family:Consolas,monospac
     <button class="btn" data-sc="blackhole">路径偏离(黑洞)</button>
     <button class="btn" data-sc="bitflip">恶意改头(s2)</button>
     <button class="btn" data-sc="dup">恶意重放(s2)</button>
+    <button class="btn" data-sc="failover">链路故障切换</button>
+    <button class="btn" data-sc="multifault">多重故障(改道+改头)</button>
     <button class="btn warn" id="reset">清零统计</button>
-    <div class="note">场景切换会重写转发表（交换机热加载）并重建控制器；恶意场景会把 s2 换成带恶意行为的交换机进程。</div>
+    <div class="note">场景切换会重写转发表（交换机热加载）并重建控制器；恶意场景会把对应交换机换成带恶意行为的进程；故障切换会物理断开 s1–s2 链路并把候选路径收敛为 P1。</div>
   </div>
   <div class="panel" style="margin-top:14px">
     <h2>验证事件流</h2>
@@ -644,11 +676,11 @@ const suspectRing=id=>{const g=document.getElementById("g_"+id);if(!g)return;
  const[x,y]=NODES[id];const r=el("circle",{cx:x,cy:y,r:10,class:"suspect"});
  r.setAttribute("style","animation:pulse 1.4s infinite");
  g.appendChild(r);setTimeout(()=>r.remove(),6000)};
-const S={last:0,shownSuspect:-1,scen:""};
+const S={last:0,shownSuspect:-1,scen:"",rings:new Set()};
 function fmt(n){return n.toLocaleString("en-US")}
 async function refresh(){
  try{const r=await fetch("/api/state");const j=await r.json();
- document.getElementById("scenlabel").textContent="当前场景："+({normal:"正常转发",tagflip:"标签错配",blackhole:"路径偏离(黑洞)",bitflip:"恶意改头(s2)",dup:"恶意重放(s2)"})[j.scenario];
+ document.getElementById("scenlabel").textContent="当前场景："+({normal:"正常转发",tagflip:"标签错配",blackhole:"路径偏离(黑洞)",bitflip:"恶意改头(s2)",dup:"恶意重放(s2)",failover:"链路故障切换",multifault:"多重故障(改道+改头)"})[j.scenario];
  const f=j.dirs[0],rv=j.dirs[1];
  const pass=f.pass+rv.pass,fail=f.fail+rv.fail,rp=f.replays+rv.replays;
  document.getElementById("vpass").textContent=fmt(pass);
@@ -680,7 +712,7 @@ async function refresh(){
   const tr=document.createElement("tr");
   let verdict=e.lost?'<span class="rp">失联</span>':e.replay?'<span class="rp">重放</span>':(e.ok?'<span class="ok">通过</span>':'<span class="bad">失败</span>');
   if(e.kind==="flow")verdict=(e.ok?'<span class="ok">流级通过</span>':'<span class="bad">流级失败</span>')+" N="+e.n;
-  const loc=e.suspect>=0?'<span class="bad">s'+e.suspect+'</span>':"–";
+  const loc=(e.suspects&&e.suspects.length)?'<span class="bad">s'+e.suspects.join(', s')+'</span>':"–";
   tr.innerHTML="<td>"+e.t.toFixed(1)+"</td><td>"+(e.kind==="flow"?"流级·":"")+mac2d(e.mac)+"</td><td>"+e.nonce+"</td><td>"+e.tag+"</td><td>"+verdict+"</td><td>"+loc+"</td><td>"+e.us.toFixed(2)+"µs</td>";
   tb.appendChild(tr)}
  // 流级窗口表
@@ -693,13 +725,14 @@ async function refresh(){
  for(let i=S.last;i<j.events.length;i++){const e=j.events[i];
   if(e.kind!=="packet")continue;
   const fwd=e.mac==="00:00:00:00:00:02";
-  const pi=e.lost?"fwd1":(e.matched>=0&&e.matched<=1?(fwd?(e.matched?"fwd1":"fwd0"):(e.matched?"rev1":"rev0")):(fwd?"fwd0":"rev0"));
+  const pi=(S.scen==="failover")?(fwd?"fwd1":"rev1"):(e.lost?"fwd1":(e.matched>=0&&e.matched<=1?(fwd?(e.matched?"fwd1":"fwd0"):(e.matched?"rev1":"rev0")):(fwd?"fwd0":"rev0")));
   const col=e.lost?"#fbbf24":e.replay?"#fbbf24":e.ok?"#4ade80":"#f87171";
   dot(PATHS[pi],col,e.lost?"s3":undefined)}
  S.last=j.events.length;
- // 嫌疑交换机
- if(j.suspect>=0&&j.suspect!==S.shownSuspect){S.shownSuspect=j.suspect;suspectRing("s"+j.suspect)}
- if(j.suspect<0)S.shownSuspect=-1;
+ // 嫌疑交换机（支持多重故障：多个节点同时标红）
+ const cur=new Set(j.suspects||[]);
+ for(const sid of cur) if(!S.rings.has(sid)){S.rings.add(sid);suspectRing("s"+sid)}
+ for(const sid of [...S.rings]) if(!cur.has(sid)) S.rings.delete(sid);
  // 黑洞提示
  const ln=document.getElementById("lostnote");
  if(j.lost.count>0){ln.innerHTML='<span class="rp">检测到 '+j.lost.count+" 个包半路失联（出口未上报）。取证定位：改道嫌疑 s"+(j.lost.suspects[0]!==undefined?j.lost.suspects[0]:"?")+'</span>'}
@@ -712,7 +745,7 @@ async function refresh(){
 setInterval(refresh,700);refresh();
 document.querySelectorAll("[data-sc]").forEach(b=>b.onclick=async()=>{
  await fetch("/api/scenario",{method:"POST",body:JSON.stringify({name:b.dataset.sc})});
- S.last=0;S.shownSuspect=-1;refresh()});
+ S.last=0;S.shownSuspect=-1;S.rings.clear();refresh()});
 document.getElementById("reset").onclick=()=>fetch("/api/reset",{method:"POST"});
 const send=async n=>{await fetch("/api/traffic",{method:"POST",body:JSON.stringify({count:n})});refresh()};
 document.getElementById("send20").onclick=()=>send(20);
@@ -781,10 +814,11 @@ int main(int argc, char** argv) {
   g_started = mono_s();
   setup_links();
   write_tables(Scenario::kNormal);
+  apply_link_state(Scenario::kNormal);
   clear_logs();
-  g_ctl = new Controller(SEED, directions());
+  g_ctl = new Controller(SEED, directions_for(Scenario::kNormal));
   g_state.stats.assign(2, DirStat{});
-  start_switches("none");
+  start_switches("none", "none");
 
   int srv = ::socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
@@ -795,6 +829,9 @@ int main(int argc, char** argv) {
   addr.sin_port = htons((uint16_t)port);
   if (::bind(srv, (sockaddr*)&addr, sizeof(addr)) != 0) {
     std::fprintf(stderr, "bind 失败（端口 %d 被占？）\n", port);
+    stop_switches();  // 不留孤儿交换机
+    topo::cleanup();
+    delete g_ctl;
     return 1;
   }
   ::listen(srv, 16);

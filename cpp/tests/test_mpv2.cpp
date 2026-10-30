@@ -285,8 +285,9 @@ static void controller_tests() {
   uint64_t e = 0;
   for (size_t j = 0; j < p0.size(); ++j) {
     e = addmod(e, mulmod(contribution(kr, p0[j], hh), powmod(RHO, (uint64_t)j)));
-    std::snprintf(line, sizeof(line), "TRACE %s %u 1 2 0 777 %zu %llu", MAC,
-                  p0[j].sid, j + 1, (unsigned long long)e);
+    std::snprintf(line, sizeof(line), "TRACE %s %u %u %u 0 777 %zu %llu", MAC,
+                  p0[j].sid, p0[j].in_port, p0[j].out_port, j + 1,
+                  (unsigned long long)e);
     ctl.feed(line);
   }
   std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
@@ -323,8 +324,9 @@ static void controller_tests() {
   e = 0;
   for (size_t j = 0; j < p0.size(); ++j) {
     e = addmod(e, mulmod(contribution(kr, p0[j], hh), powmod(RHO, (uint64_t)j)));
-    std::snprintf(line, sizeof(line), "TRACE %s %u 1 2 0 999 %zu %llu", MAC,
-                  p0[j].sid, j + 1, (unsigned long long)e);
+    std::snprintf(line, sizeof(line), "TRACE %s %u %u %u 0 999 %zu %llu", MAC,
+                  p0[j].sid, p0[j].in_port, p0[j].out_port, j + 1,
+                  (unsigned long long)e);
     ctl.feed(line);
   }
   std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
@@ -333,6 +335,35 @@ static void controller_tests() {
   ev = ctl.feed(line);
   CHECK(!ev.ok, "出口上报篡改被拒");
   CHECK_EQ(ev.suspect_sid, 4, "取证定位到出口 s4");
+
+  // 多故障：s1 改端口（改道）+ s4 篡改 —— 定位应同时报出 {1, 4}
+  // 实际路由 s1(1,3) → s5(1,2) → s4(2,3)，仅在 s4 处翻转 1 比特
+  {
+    const unsigned long long n7 = 1111;
+    uint64_t h7 = h_of(n7);
+    uint64_t v1 = contribution(kr, Hop{1, 1, 3}, h7);
+    uint64_t v2 = addmod(v1, mulmod(contribution(kr, Hop{5, 1, 2}, h7), RHO));
+    uint64_t v3 = addmod(v2, mulmod(contribution(kr, Hop{4, 2, 3}, h7),
+                                    mulmod(RHO, RHO)));
+    uint64_t v3t = v3 ^ 1;
+    std::snprintf(line, sizeof(line), "TRACE %s 1 1 3 0 1111 1 %llu", MAC,
+                  (unsigned long long)v1);
+    ctl.feed(line);
+    std::snprintf(line, sizeof(line), "TRACE %s 5 1 2 0 1111 2 %llu", MAC,
+                  (unsigned long long)v2);
+    ctl.feed(line);
+    std::snprintf(line, sizeof(line), "TRACE %s 4 2 3 0 1111 3 %llu", MAC,
+                  (unsigned long long)v3t);
+    ctl.feed(line);
+    std::snprintf(line, sizeof(line), "4 0 %llu %llu %s", n7,
+                  (unsigned long long)v3t, MAC);
+    Event ev7 = ctl.feed(line);
+    CHECK(!ev7.ok, "多故障包被拒");
+    CHECK_EQ(ev7.suspects.size(), 2, "多故障定位报出两个嫌疑");
+    CHECK_EQ(ev7.suspects.empty() ? -1 : ev7.suspects[0], 1, "改道嫌疑 s1");
+    CHECK_EQ(ev7.suspects.size() > 1 ? ev7.suspects[1] : -1, 4, "篡改嫌疑 s4");
+    CHECK_EQ(ev7.suspect_sid, 1, "首个嫌疑 = s1");
+  }
 
   // 流级：F L O W 行一次判定
   FlowAgg agg;

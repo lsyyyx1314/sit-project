@@ -102,6 +102,16 @@ void write_tables(Scenario sc) {
     s3 << H2MAC << " 1 2 2 0 1\n" << H1MAC << " 1 1 2 0 2\n";  // 无 tag0 → 丢弃
     s4 << H2MAC << " 0 3 3 1 1\n" << H2MAC << " 1 3 3 1 2\n"
        << H1MAC << " 0 1 1 0 3\n" << H1MAC << " 1 2 1 0 3\n";
+  } else if (sc == Scenario::kFailover) {
+    // 链路故障切换：s1–s2 断开（apply_link_state 置 down），tag0 全网改走 P1
+    // 分支，控制器候选集同步收敛为 {P1} → 切换后验证继续全通过（零误报）。
+    s1 << H2MAC << " 0 3 1 0 1\n" << H2MAC << " 1 3 1 0 1\n"
+       << H1MAC << " 0 1 3 1 2\n" << H1MAC << " 1 1 3 1 3\n";
+    s2 << H2MAC << " 0 2 2 0 1\n" << H1MAC << " 0 1 2 0 2\n";  // 不可达，保留原表
+    s3 << H2MAC << " 0 2 2 0 1\n" << H2MAC << " 1 2 2 0 1\n"
+       << H1MAC << " 0 1 2 0 2\n" << H1MAC << " 1 1 2 0 2\n";
+    s4 << H2MAC << " 0 3 3 1 2\n" << H2MAC << " 1 3 3 1 2\n"
+       << H1MAC << " 0 2 1 0 3\n" << H1MAC << " 1 2 1 0 3\n";
   } else {  // kNormal
     s1 << H2MAC << " 0 2 1 0 1\n" << H2MAC << " 1 3 1 0 1\n"
        << H1MAC << " 0 1 3 1 2\n" << H1MAC << " 1 1 3 1 3\n";
@@ -114,6 +124,17 @@ void write_tables(Scenario sc) {
   write_file(table_path(2), s2.str());
   write_file(table_path(3), s3.str());
   write_file(table_path(4), s4.str());
+}
+
+void apply_link_state(Scenario sc) {
+  // failover：物理断开 s1–s2 互联链路（两端都 down，帧级不可达）
+  if (sc == Scenario::kFailover) {
+    must("ip link set s1p2 down");
+    must("ip link set s2p1 down");
+  } else {
+    must("ip link set s1p2 up");
+    must("ip link set s2p1 up");
+  }
 }
 
 void clear_logs() {
@@ -189,6 +210,15 @@ std::vector<mpv::Path> cand_rev() {
 
 std::vector<mpv::Direction> directions() {
   return {{H2MAC, cand_fwd()}, {H1MAC, cand_rev()}};
+}
+
+std::vector<mpv::Direction> directions_for(Scenario sc) {
+  if (sc == Scenario::kFailover) {
+    // P0 不可达：候选收敛为 {P1}，tag0 即 P1
+    std::vector<mpv::Path> fwd{cand_fwd()[1]}, rev{cand_rev()[1]};
+    return {{H2MAC, fwd}, {H1MAC, rev}};
+  }
+  return directions();
 }
 
 }  // namespace topo

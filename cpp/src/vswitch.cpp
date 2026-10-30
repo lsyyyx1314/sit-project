@@ -185,6 +185,7 @@ class VSwitch {
         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
         break;
       }
+      if (n == 0) break;  // 接口被删除等异常：0 帧不是合法以太帧，避免空转
       if (sll.sll_pkttype == PACKET_OUTGOING) continue;  // 过滤本端口发出的帧
       ++in_;
       handle(buf, static_cast<size_t>(n), p.index);
