@@ -1,31 +1,28 @@
-// 端到端上报验证器：读取交换机上报，按候选路径集合判定并定位。
+// 端到端上报验证器：读取交换机上报，经共享控制器模块判定并定位。
 //
 // 输入：
 //   --cand   候选路径描述（每方向一块）
-//   --report 交换机上报（每行：sid tag nonce acc dst_mac）
+//   --report 交换机上报文件（逐包行 / FLOW 行 / TRACE 行均可混排）
 //   --seed   密钥种子
 //
 // 候选描述格式：
 //     DIR <dst_mac> <路径数>
 //     PATH <sid:in:out> <sid:in:out> ...
+//
+// 输出：每方向的逐包判定（CPMV tag 模式，失败回退 BPMV scan）、流级判定
+// （CFMV）、重放计数与定位结论；退出码 1 表示存在验证失败。
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "mpv2.h"
+#include "controller.h"
 
 using namespace mpv;
 
 namespace {
-
-struct Direction {
-  std::string mac;
-  std::vector<Path> paths;
-};
 
 std::vector<Direction> load_cand(const std::string& file) {
   std::vector<Direction> dirs;
@@ -72,72 +69,35 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  KeyRing kr = KeyRing::generate(16, 4, seed);
   std::vector<Direction> dirs = load_cand(cand);
-
-  std::vector<ExpectationTable> tables;
-  for (const Direction& d : dirs) tables.emplace_back(kr, d.paths);
-
-  struct Stat {
-    int total = 0, pass = 0, fail = 0, localized = 0;
-    int matched_idx = -1;
-    int claimed = -1;
-    int diverge_sid = -1;
-  };
-  std::vector<Stat> stats(dirs.size());
+  Controller ctl(seed, dirs);
 
   std::ifstream in(report);
   std::string line;
-  while (std::getline(in, line)) {
-    if (line.empty()) continue;
-    unsigned sid, tag;
-    unsigned long long nonce, acc;
-    char mac[32];
-    if (std::sscanf(line.c_str(), "%u %u %llu %llu %31s", &sid, &tag, &nonce,
-                    &acc, mac) != 5)
-      continue;
-    Header h{nonce, acc, (uint8_t)tag};
-    for (size_t i = 0; i < dirs.size(); ++i) {
-      if (dirs[i].mac != mac) continue;
-      Stat& s = stats[i];
-      ++s.total;
-      Verdict v = tables[i].verify_tag(h);
-      if (v.ok) {
-        ++s.pass;
-      } else {
-        ++s.fail;
-        Verdict sc = tables[i].verify_scan(h);
-        if (sc.matched >= 0) {
-          ++s.localized;
-          s.matched_idx = sc.matched;
-          s.claimed = (int)tag;
-          // 分歧点 = 声称路径与真实路径的最后一个共同交换机
-          const Path& a = dirs[i].paths[(size_t)tag];
-          const Path& b = dirs[i].paths[(size_t)sc.matched];
-          size_t common = 0;
-          while (common < a.size() && common < b.size() &&
-                 a[common].sid == b[common].sid)
-            ++common;
-          s.diverge_sid = (int)a[common > 0 ? common - 1 : 0].sid;
-        }
-      }
-      break;
-    }
-  }
+  while (std::getline(in, line)) ctl.feed(line);
 
   int rc = 0;
   for (size_t i = 0; i < dirs.size(); ++i) {
-    const Stat& s = stats[i];
-    if (s.total == 0) continue;
-    std::printf("  %s: 通过 %d / 失败 %d / 共 %d\n", dirs[i].mac.c_str(), s.pass,
-                s.fail, s.total);
-    if (s.fail > 0 && s.localized > 0) {
-      std::printf("      → 实际命中候选 #%d，标签声称 #%d：路径标签错配，分歧点 s%d\n",
-                  s.matched_idx, s.claimed, s.diverge_sid);
-    } else if (s.fail > 0) {
-      std::printf("      → 未命中任何候选：路径偏离或验证头被篡改\n");
+    const DirStat& s = ctl.stat(i);
+    if (s.packets == 0 && s.flows == 0) continue;
+    std::printf("  %s: 通过 %llu / 失败 %llu / 共 %llu",
+                dirs[i].mac.c_str(), (unsigned long long)s.pass,
+                (unsigned long long)s.fail, (unsigned long long)s.packets);
+    if (s.replays)
+      std::printf("，重放 %llu", (unsigned long long)s.replays);
+    std::printf("\n");
+    if (s.flows)
+      std::printf("      流级(CFMV)：窗口 %llu，通过 %llu / 失败 %llu\n",
+                  (unsigned long long)s.flows, (unsigned long long)s.flow_pass,
+                  (unsigned long long)s.flow_fail);
+    if (s.fail > 0) {
+      if (s.localized > 0)
+        std::printf("      → 已定位嫌疑交换机（逐跳取证 / 候选对比，见 dashboard 或 e2e 输出）\n");
+      else
+        std::printf("      → 未命中任何候选且无取证：路径偏离或验证头被篡改\n");
+      rc = 1;
     }
-    if (s.fail > 0) rc = 1;
+    if (s.flow_fail > 0) rc = 1;
   }
   return rc;
 }
