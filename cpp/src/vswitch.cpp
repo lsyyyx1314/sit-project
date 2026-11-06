@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <csignal>
 #include <cerrno>
 #include <cstdio>
@@ -100,6 +101,8 @@ uint64_t fresh_nonce() {
 
 enum class Evil { kNone, kBitflip, kDup };
 
+std::atomic<bool> g_stop{false};  // SIGTERM/SIGINT 置位，run() 主循环退出
+
 class VSwitch {
  public:
   VSwitch(uint32_t sid, uint64_t seed, std::string table, std::string report,
@@ -150,7 +153,7 @@ class VSwitch {
     std::vector<pollfd> pfds;
     for (const Port& p : ports_) pfds.push_back(pollfd{p.fd, POLLIN, 0});
     uint32_t last_check = 0;
-    while (true) {
+    while (!g_stop.load(std::memory_order_relaxed)) {
       int n = ::poll(pfds.data(), pfds.size(), 200);
       if (n > 0) {
         for (size_t i = 0; i < pfds.size(); ++i) {
@@ -377,13 +380,10 @@ int open_port(const std::string& name) {
 
 VSwitch* g_sw = nullptr;
 
-void on_term(int) {
-  if (g_sw) {
-    g_sw->flush_flows();
-    g_sw->stats();
-  }
-  std::_Exit(0);
-}
+// 信号处理函数只做原子写（异步信号安全）；
+// 未决窗口的冲刷与统计打印由主循环退出后在主线程完成——
+// 此前在 handler 里直接 fprintf/std::fopen，与主线程的 stdio 并发是未定义行为。
+void on_term(int) { g_stop = true; }
 
 }  // namespace
 
@@ -440,5 +440,8 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, on_term);
   std::signal(SIGINT, on_term);
   sw.run();
+  // 主线程里完成收尾：未满窗口的流级聚合冲进上报文件 + 统计
+  g_sw->flush_flows();
+  g_sw->stats();
   return 0;
 }

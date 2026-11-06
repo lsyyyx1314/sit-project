@@ -13,11 +13,13 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cerrno>
 #include <csignal>
 
 #include <atomic>
@@ -77,6 +79,10 @@ void blackhole_check();  // 定义在交换机管理之后
 
 // 后台跑一轮流量：ping 完成后视场景做黑洞定位
 void traffic_worker(int count) {
+  {
+    std::lock_guard<std::mutex> lk(g_state.mu);
+    g_state.traffic_packets += (uint64_t)count;
+  }
   run_traffic(count, "0.04");
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
   bool bh = false;
@@ -514,9 +520,10 @@ std::string http_post(int, const std::string& path, const std::string& body) {
           if (v > 0 && v <= 500) count = v;
         }
       }
-      g_state.traffic_packets += (uint64_t)count;
     }
-    // 异步执行：POST 立即返回，避免占用连接线程（ping 最多几秒）
+    // 异步执行：POST 立即返回，避免占用连接线程（ping 最多几秒）。
+    // 计数在 worker 真正接手后才累加——此前先加后 CAS，被并发拒绝的请求
+    // 也会被计入，UI 的「已发送包数」会虚高。
     bool expect = false;
     if (g_traffic_running.compare_exchange_strong(expect, true))
       std::thread(traffic_worker, count).detach();
@@ -630,18 +637,18 @@ td{padding:4px 6px;border-bottom:1px solid #1a2440;font-family:Consolas,monospac
   <div class="panel" style="margin-top:14px">
     <h2>单次判定时延 vs 候选路径数 k（bench 实测，7 跳）</h2>
     <svg id="chart" width="100%" height="150" viewBox="0 0 460 150"></svg>
-    <div class="legend"><i style="background:var(--acc)"></i>tag（CPMV）<i style="background:var(--replay)"></i>scan（BPMV）—— tag 模式与 k 无关</div>
+    <div class="legend"><i style="background:var(--acc)"></i>tag（CPMV）<i style="background:var(--replay)"></i>scan（BPMV）—— tag 模式与 k 无关（VM 实测，bench/exp 报告同源）</div>
   </div>
   <div class="panel" style="margin-top:14px" id="flowbox">
     <h2>流级窗口（CFMV）判定</h2>
     <table><thead><tr><th>时间</th><th>方向</th><th>tag</th><th>窗口包数 N</th><th>结论</th><th>判定耗时</th></tr></thead>
     <tbody id="flowevt"></tbody></table>
-    <div class="note">ΣV = N·A + B·Σh：出口按流聚合，控制器每窗口一次判定；N=4096 时仍为 0.04µs（与 N 无关）。</div>
+    <div class="note">ΣV = N·A + B·Σh：出口按流聚合，控制器每窗口一次判定；N=4096 时仍为 0.03~0.05µs（与 N 无关）。</div>
   </div>
 </div>
 </div></div>
 <script>
-const KS=[1,2,4,8,16,32,64],TAG=[0.271,0.350,0.310,0.310,0.310,0.271,0.211],SCAN=[0.271,0.351,0.321,0.351,0.391,0.440,0.471];
+const KS=[1,2,4,8,16,32,64],TAG=[0.33,0.33,0.33,0.33,0.33,0.31,0.33],SCAN=[0.33,0.34,0.35,0.37,0.43,0.44,0.76];
 const NODES={h1:[36,165],s1:[136,165],s2:[268,85],s3:[268,245],s4:[400,165],h2:[508,165]};
 const EDGES=[["h1","s1"],["s1","s2"],["s1","s3"],["s2","s4"],["s3","s4"],["s4","h2"]];
 const PATHS={
@@ -752,11 +759,11 @@ document.getElementById("send20").onclick=()=>send(20);
 document.getElementById("send100").onclick=()=>send(100);
 // 时延-k 折线
 (()=>{const c=document.getElementById("chart");const W=460,H=150,px=40,py=18;
- const mx=0.55,mn=0.18;const X=i=>px+i*(W-px-14)/(KS.length-1);
+ const mx=0.85,mn=0.18;const X=i=>px+i*(W-px-14)/(KS.length-1);
  const Y=v=>H-py-(v-mn)/(mx-mn)*(H-2*py);
  c.appendChild(el("line",{x1:px,y1:H-py,x2:W-14,y2:H-py,stroke:"#23304f"}));
  c.appendChild(el("line",{x1:px,y1:py,x2:px,y2:H-py,stroke:"#23304f"}));
- [[0.2,"0.2"],[0.35,"0.35"],[0.5,"0.5"]].forEach(([v,l])=>{const t=el("text",{x:px-6,y:Y(v)+4,"text-anchor":"end","font-size":"10"});t.textContent=l;c.appendChild(t)});
+ [[0.2,"0.2"],[0.45,"0.45"],[0.7,"0.7"]].forEach(([v,l])=>{const t=el("text",{x:px-6,y:Y(v)+4,"text-anchor":"end","font-size":"10"});t.textContent=l;c.appendChild(t)});
  KS.forEach((k,i)=>{const t=el("text",{x:X(i),y:H-py+14,"text-anchor":"middle","font-size":"10"});t.textContent="k="+k;c.appendChild(t)});
  const line=(arr,color)=>{c.appendChild(el("polyline",{points:arr.map((v,i)=>X(i)+","+Y(v)).join(" "),fill:"none",stroke:color,"stroke-width":2.5}));
   arr.forEach((v,i)=>c.appendChild(el("circle",{cx:X(i),cy:Y(v),r:3,fill:color})))};
@@ -765,9 +772,11 @@ document.getElementById("send100").onclick=()=>send(100);
 </script></body></html>)HTML";
 
 std::string http_get(int, const std::string& path) {
-  if (path == "/api/state")
-    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
-           json_state();
+  if (path == "/api/state") {
+    std::string body = json_state();
+    return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+           std::to_string(body.size()) + "\r\n\r\n" + body;
+  }
   std::string page = kPage;
   return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
          "Content-Length: " +
@@ -775,10 +784,13 @@ std::string http_get(int, const std::string& path) {
 }
 
 // ---------------------------------------------------------------- main
-void on_term(int) {
-  for (pid_t p : g_pids) ::kill(p, SIGTERM);
-  topo::cleanup();
-  std::_Exit(0);
+// 信号处理只做异步信号安全的 write（自管道）；拓扑与交换机的清理在主线程完成——
+// 此前 handler 里直接调 system()/stdio（非异步信号安全），是未定义行为。
+int g_sig_w = -1;
+
+void on_term_sig(int) {
+  ssize_t r = ::write(g_sig_w, "x", 1);
+  (void)r;
 }
 
 }  // namespace
@@ -836,19 +848,60 @@ int main(int argc, char** argv) {
   }
   ::listen(srv, 16);
 
+  // 信号 → 自管道，主循环统一 poll（监听套接字 + 信号管道）
+  int sigpipe[2];
+  if (::pipe(sigpipe) != 0) {
+    std::fprintf(stderr, "pipe 失败\n");
+    stop_switches();
+    topo::cleanup();
+    delete g_ctl;
+    return 1;
+  }
+  g_sig_w = sigpipe[1];
+  std::signal(SIGTERM, on_term_sig);
+  std::signal(SIGINT, on_term_sig);
+
   std::thread t_tail(tailer_loop);
   t_tail.detach();
-
-  std::signal(SIGTERM, on_term);
-  std::signal(SIGINT, on_term);
 
   std::printf("MPV-2 演示控制台已启动：http://0.0.0.0:%d  （Ctrl-C 退出并清理拓扑）\n",
               port);
   std::fflush(stdout);
+
+  // 并发连接上限：超出直接 503，防止线程被慢连接拖垮
+  constexpr int kMaxConns = 32;
+  std::atomic<int> g_conns{0};
+  const char* k503 =
+      "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
+      "Content-Length: 0\r\n\r\n";
+
   while (true) {
+    struct pollfd pf[2] = {{srv, POLLIN, 0}, {sigpipe[0], POLLIN, 0}};
+    int pr = ::poll(pf, 2, -1);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pf[1].revents & POLLIN) break;  // SIGTERM/SIGINT：主线程收尾
+    if (!(pf[0].revents & POLLIN)) continue;
     int fd = ::accept(srv, nullptr, nullptr);
     if (fd < 0) continue;
-    std::thread(serve, fd).detach();
+    if (g_conns.load() >= kMaxConns) {
+      std::string r503(k503);
+      (void)!::send(fd, r503.data(), r503.size(), 0);
+      ::close(fd);
+      continue;
+    }
+    ++g_conns;
+    std::thread([fd, &g_conns] {
+      serve(fd);
+      --g_conns;
+    }).detach();
   }
-  return 0;
+
+  // 主线程收尾：停交换机 → 清拓扑 → 释放控制器
+  stop_switches();
+  topo::cleanup();
+  delete g_ctl;
+  std::_Exit(0);
 }
