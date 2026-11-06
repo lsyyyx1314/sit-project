@@ -8,6 +8,12 @@
 //   [6] 验证头长度 vs 跳数（与逐跳追加式方案对比）
 //   [7] 端到端：四类攻击场景各 R 轮，统计检出率/定位成功率/误报率
 //       + ping 洪泛测数据面管道吞吐
+//   [8] 状态存储开销：控制器期望表 vs k、出口 CFMV 聚合 vs 活跃流、nonce 窗口
+//   [9] 异常交换机定位成功率：随机故障位置大样本（单故障/双故障/诚实对照）
+//       + 有取证 vs 无取证定位对照
+//   [10] 算法级基线对比：逐跳 MAC 链（Icing 类）判定时延 vs k、
+//        概率采样多路径（Atlas 类）漏检率 vs 判定负载
+//   [11] 规模扩展：路径跳数 h 下的数据面/控制面开销与检出率
 //
 // 输出：results/exp_report.md + results/charts/*.svg，stdout 打摘要。
 // 需 root（[7] 要建 netns 拓扑）。用法： sudo ./build/exp [--trials N] [--rounds R]
@@ -26,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "blake2b.h"
 #include "controller.h"
 #include "mpv2.h"
 #include "topo.h"
@@ -412,6 +419,452 @@ void exp_header() {
             ticks, hs, ss, 70);
 }
 
+// ---------------------------------------------------------------- [8] 存储开销
+// 口径：按结构实测条目数 × 字段宽（sizeof），不是进程 RSS——这样不同方案
+// 在同一口径下可比，且数字可由结构定义直接复核。
+void exp_storage() {
+  g_report << "\n## [8] 状态存储开销（条目数 × 字段宽，可由结构定义复核）\n\n";
+
+  // 控制器侧：期望表 O(k)，与跳数无关（A、B 两个 64 位聚合值）
+  g_report << "### 控制器侧：期望表随候选路径数 k（h=7）\n\n";
+  g_report << "| k | 期望表 (B) | 路径索引 (B) | 合计 (B) |\n|---|---|---|---|\n";
+  for (uint32_t k : {1u, 2u, 4u, 8u, 16u, 32u, 64u}) {
+    size_t e = (size_t)k * sizeof(Expectation);            // A,B：8B × 2
+    size_t x = (size_t)k * 7 * sizeof(Hop);                // 索引：sid+in+out 12B/跳
+    g_report << "| " << k << " | " << e << " | " << x << " | " << e + x << " |\n";
+  }
+  g_report << "- nonce 重放窗口：每方向固定 " << 4096 * 8 << " B（容量 4096，与速率无关）\n";
+  g_report << "- 对照：逐跳 MAC 链基线无预计算表，但每包判定需 O(k·h) 次哈希（见 [10]）"
+              "——以计算换存储，本方案把两边同时做成 O(k)/O(1)。\n";
+
+  // 出口交换机侧：CFMV 三元组 24B/(流,tag) vs 逐流路径记录式 8B×h/流
+  g_report << "\n### 出口交换机侧：流级聚合状态随活跃流数（h=7）\n\n";
+  g_report << "| 活跃流数 | CFMV 三元组 (B) | 逐流路径记录式 (B) | 倍率 |\n|---|---|---|---|\n";
+  std::vector<double> fs;
+  std::vector<std::pair<double, double>> c1, c2;
+  std::vector<std::string> ticks;
+  for (uint64_t f : {1000ull, 2000ull, 4000ull, 8000ull, 16000ull, 32000ull}) {
+    size_t a = (size_t)f * sizeof(FlowAgg);                // n+Σh+ΣV：8B × 3
+    size_t b = (size_t)f * 7 * 8;                          // 每流逐跳记录：8B × h
+    g_report << "| " << f << " | " << a << " | " << b << " | " << (double)b / a << "× |\n";
+    fs.push_back((double)f); ticks.push_back(std::to_string(f / 1000) + "k");
+    c1.push_back({(double)f, a / 1024.0});
+    c2.push_back({(double)f, b / 1024.0});
+  }
+  std::vector<Series> ss{{"CFMV 聚合（24B/流）", "#4ade80", c1},
+                         {"逐流路径记录式（8B×7/流）", "#fbbf24", c2}};
+  svg_chart("chart_storage.svg", "出口交换机状态存储 vs 活跃流数", "活跃流数", "KB",
+            ticks, fs, ss, c2.back().second * 1.15);
+  g_report << "- 数据面转发路径：逐跳更新 V 无逐流状态（0 B/跳）；全系统逐流状态只出现在"
+              "出口聚合（24B/流）与 nonce 窗口（定长）。\n";
+}
+
+// ---------------------------------------------------------------- [9] 定位成功率
+struct HopRec {
+  uint32_t sid, in, out, pos;
+  uint64_t v;
+};
+
+// 沿实际路径逐跳生成取证记录（与 vswitch --trace 同口径：pos 1 基），
+// tamper_hop >= 0 时该跳在合法贡献之后翻转 1 bit（恶意改头）。
+std::vector<HopRec> trace_of(const KeyRing& kr, const Path& p, uint64_t nonce,
+                             int tamper_hop) {
+  std::vector<HopRec> recs;
+  uint64_t acc = 0;
+  for (size_t i = 0; i < p.size(); ++i) {
+    acc = addmod(acc, mulmod(contribution(kr, p[i], h_of(nonce)),
+                             powmod(RHO, (uint64_t)i)));
+    if ((int)i == tamper_hop) acc ^= 1;  // 篡改后下游在篡改值上继续（与 vswitch 一致）
+    recs.push_back({p[i].sid, p[i].in_port, p[i].out_port, (uint32_t)(i + 1), acc});
+  }
+  return recs;
+}
+
+size_t first_div(const Path& a, const Path& b) {
+  size_t i = 0;
+  while (i < a.size() && i < b.size() && a[i] == b[i]) ++i;
+  return i;
+}
+
+void exp_localization(int trials) {
+  g_report << "\n## [9] 异常交换机定位成功率（随机路径 5–9 跳，随机故障位置）\n\n";
+  Rng rng(777);
+  const KeyRing kr = KeyRing::generate(16, 4, SEED);
+  const char* MAC = "00:00:00:00:00:02";
+
+  // 主实验：单候选集 + 逐跳取证。四类样本：单篡改 / 单改道 / 双故障 / 诚实对照。
+  // 真值口径：篡改跳 = 实际路径该跳 sid；改道跳 = 声称路径首分歧跳 sid（与
+  // 控制器定位语义一致）。真攻击纪律：bad == claimed 的样本不计入。
+  int tam_n = 0, tam_hit = 0, dev_n = 0, dev_hit = 0, two_n = 0, two_hit = 0;
+  int ho_n = 0, ho_ok = 0, overmark = 0;
+  int exact_all = 0, fault_all = 0;
+  for (int t = 0; t < trials; ++t) {
+    Path p = rand_path(rng, rng.range(4, 8));  // 总跳数 5–9
+    uint64_t nonce = rng.nonce();
+    uint32_t mode = (uint32_t)(rng.next() % 4);
+    Path bad = p;
+    int tam = -1;
+    bool dev = false;
+    if (mode == 0 || mode == 2) tam = (int)rng.range(0, (uint32_t)p.size() - 1);
+    if (mode == 1 || mode == 2) {
+      for (int tries = 0; tries < 10 && !dev; ++tries) {
+        bad = (rng.next() % 2) ? atk_out_port(p, rng) : atk_bypass(p, rng);
+        dev = !(bad == p);
+      }
+      if (!dev) continue;
+    }
+    Controller c(SEED, {Direction{MAC, {p}}});
+    auto recs = trace_of(kr, bad, nonce, tam);
+    char buf[192];
+    for (const HopRec& r : recs) {
+      std::snprintf(buf, sizeof(buf), "TRACE %s %u %u %u 0 %llu %u %llu", MAC,
+                    r.sid, r.in, r.out, (unsigned long long)nonce, r.pos,
+                    (unsigned long long)r.v);
+      c.feed(buf);
+    }
+    std::snprintf(buf, sizeof(buf), "4 0 %llu %llu %s",
+                  (unsigned long long)nonce, (unsigned long long)recs.back().v, MAC);
+    Event ev = c.feed(buf);
+
+    if (!dev && tam < 0) {  // 诚实样本：应判定通过且无嫌疑
+      ++ho_n;
+      if (ev.ok && ev.suspects.empty()) ++ho_ok;
+      continue;
+    }
+    std::vector<int> truth;
+    if (tam >= 0) truth.push_back((int)bad[tam].sid);
+    if (dev) {
+      size_t fd = first_div(p, bad);
+      if (fd >= p.size()) fd = p.size() - 1;
+      truth.push_back((int)p[fd].sid);
+    }
+    std::sort(truth.begin(), truth.end());
+    truth.erase(std::unique(truth.begin(), truth.end()), truth.end());
+    std::vector<int> sus = ev.suspects;
+    std::sort(sus.begin(), sus.end());
+    bool hit = truth == sus;
+    bool over = false;
+    for (int s : sus)
+      if (!std::binary_search(truth.begin(), truth.end(), s)) over = true;
+    if (over) ++overmark;
+    ++fault_all;
+    if (hit) ++exact_all;
+    if (dev && tam < 0) { ++dev_n; if (hit) ++dev_hit; }
+    else if (!dev && tam >= 0) { ++tam_n; if (hit) ++tam_hit; }
+    else { ++two_n; if (hit) ++two_hit; }
+  }
+  g_report << "| 故障类型 | 样本数 | 嫌疑集精确命中 | 精确率 |\n|---|---|---|---|\n";
+  g_report << "| 恶意改头（S9） | " << tam_n << " | " << tam_hit << " | "
+           << (tam_n ? 100.0 * tam_hit / tam_n : 0) << "% |\n";
+  g_report << "| 路径改道（S1/S3） | " << dev_n << " | " << dev_hit << " | "
+           << (dev_n ? 100.0 * dev_hit / dev_n : 0) << "% |\n";
+  g_report << "| 双故障（改头+改道） | " << two_n << " | " << two_hit << " | "
+           << (two_n ? 100.0 * two_hit / two_n : 0) << "% |\n";
+  g_report << "| 诚实对照（误报） | " << ho_n << " | 误报 " << (ho_n - ho_ok)
+           << " | " << (ho_n ? 100.0 * ho_ok / ho_n : 0) << "% |\n";
+  g_report << "- 全部故障样本精确命中率：" << exact_all << "/" << fault_all << "（"
+           << (fault_all ? 100.0 * exact_all / fault_all : 0) << "%），"
+           << "含诚实交换机误标样本 " << overmark << " 个\n";
+
+  // 对照：k=4 候选集，有取证 vs 无取证。改道到合法路径（tagflip 类）两种都
+  // 能定位；集合外篡改只有取证能定位——这是 --trace 取证存在的理由。
+  g_report << "\n### 对照：有逐跳取证 vs 无取证（k=4 候选集，各 "
+           << trials / 4 << " 次）\n\n";
+  std::vector<Path> cands;
+  for (uint32_t i = 0; i < 4; ++i) {
+    Path q;
+    q.push_back(Hop{1, 1, 2});
+    q.push_back(Hop{2 + i, 1, 2});
+    q.push_back(Hop{6 + i, 1, 3});
+    q.push_back(Hop{10 + i, 1, 2});
+    q.push_back(Hop{16, 1, 2});
+    cands.push_back(q);
+  }
+  int tf[2] = {0, 0}, tf_n = 0, bf[2] = {0, 0}, bf_n = 0;
+  for (int t = 0; t < trials / 2; ++t) {
+    uint64_t nonce = rng.nonce();
+    // B1 改道到合法路径：沿 cands[j] 转发却声称 tag 0。两种口径各自有定义：
+    //   有取证 = 声称路径首分歧跳；无取证 = 候选对比的最后公共交换机（路由分歧点）
+    {
+      uint32_t j = rng.range(1, 3);
+      Header h = forward(kr, cands[j], 0, nonce);
+      size_t fd = first_div(cands[0], cands[j]);
+      size_t common = 0;
+      while (common < cands[0].size() && common < cands[j].size() &&
+             cands[0][common].sid == cands[j][common].sid)
+        ++common;
+      int want[2] = {(int)cands[0][common > 0 ? common - 1 : 0].sid,
+                     (int)cands[0][fd].sid};
+      for (int with_trace = 0; with_trace < 2; ++with_trace) {
+        Controller c(SEED, {Direction{MAC, cands}});
+        char buf[192];
+        if (with_trace) {
+          for (const HopRec& r : trace_of(kr, cands[j], nonce, -1)) {
+            std::snprintf(buf, sizeof(buf), "TRACE %s %u %u %u 0 %llu %u %llu", MAC,
+                          r.sid, r.in, r.out, (unsigned long long)nonce, r.pos,
+                          (unsigned long long)r.v);
+            c.feed(buf);
+          }
+        }
+        std::snprintf(buf, sizeof(buf), "4 0 %llu %llu %s",
+                      (unsigned long long)nonce, (unsigned long long)h.acc, MAC);
+        Event ev = c.feed(buf);
+        if (!ev.ok && ev.suspects.size() == 1 && ev.suspects[0] == want[with_trace])
+          ++tf[with_trace];
+      }
+      ++tf_n;
+    }
+    // B2 集合外篡改：cands[0] 改一跳出端口，不在任何候选里
+    {
+      Path bad;
+      for (int tries = 0; tries < 10; ++tries) {
+        bad = atk_out_port(cands[0], rng);
+        if (!(bad == cands[0])) break;
+      }
+      if (!(bad == cands[0])) {
+        uint64_t n2 = rng.nonce();
+        Header h = forward(kr, bad, 0, n2);
+        for (int with_trace = 0; with_trace < 2; ++with_trace) {
+          Controller c(SEED, {Direction{MAC, cands}});
+          if (with_trace) {
+            char buf[192];
+            for (const HopRec& r : trace_of(kr, bad, n2, -1)) {
+              std::snprintf(buf, sizeof(buf), "TRACE %s %u %u %u 0 %llu %u %llu", MAC,
+                            r.sid, r.in, r.out, (unsigned long long)n2, r.pos,
+                            (unsigned long long)r.v);
+              c.feed(buf);
+            }
+          }
+          char buf[128];
+          std::snprintf(buf, sizeof(buf), "4 0 %llu %llu %s",
+                        (unsigned long long)n2, (unsigned long long)h.acc, MAC);
+          Event ev = c.feed(buf);
+          size_t fd = first_div(cands[0], bad);
+          if (!ev.ok && ev.suspects.size() == 1 &&
+              ev.suspects[0] == (int)cands[0][fd].sid)
+            ++bf[with_trace];
+        }
+        ++bf_n;
+      }
+    }
+  }
+  g_report << "| 故障 | 有取证定位 | 无取证定位 |\n|---|---|---|\n";
+  g_report << "| 改道到合法路径（tagflip） | " << tf[1] << "/" << tf_n << "（"
+           << (tf_n ? 100.0 * tf[1] / tf_n : 0) << "%） | " << tf[0] << "/" << tf_n
+           << "（" << (tf_n ? 100.0 * tf[0] / tf_n : 0) << "%） |\n";
+  g_report << "| 集合外篡改（改出端口） | " << bf[1] << "/" << bf_n << "（"
+           << (bf_n ? 100.0 * bf[1] / bf_n : 0) << "%） | " << bf[0] << "/" << bf_n
+           << "（" << (bf_n ? 100.0 * bf[0] / bf_n : 0) << "%） |\n";
+  g_report << "- 结论：合法集合内的改道可由候选对比定位（取证非必需）；"
+              "集合外篡改只有逐跳取证能定位——取证开销换的是闭集之外的可定位性。\n";
+}
+
+// ---------------------------------------------------------------- [10] 基线对比
+// 基线 A（Icing 类）：逐跳 MAC 链。每跳算 8B tag 并追加进验证头，控制器对
+// 候选路径重放整条链。与 MPV-2 共用同一密钥体系（端口密钥），同测试床公平。
+uint64_t mac_hop(const KeyRing& kr, const Hop& h, uint64_t prev) {
+  uint8_t k[32] = {0}, buf[20];
+  uint64_t ks = kr.port_key(h);
+  for (int i = 0; i < 8; ++i) k[i] = (uint8_t)((ks >> (8 * (7 - i))) & 0xff);
+  for (int i = 0; i < 8; ++i) buf[i] = (uint8_t)((prev >> (8 * (7 - i))) & 0xff);
+  uint32_t f[3] = {h.sid, h.in_port, h.out_port};
+  for (int j = 0; j < 3; ++j)
+    for (int i = 0; i < 4; ++i) buf[8 + 4 * j + i] = (uint8_t)((f[j] >> (8 * (3 - i))) & 0xff);
+  uint8_t out[8];
+  blake2b(out, 8, buf, sizeof(buf), k, 32);
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | out[i];
+  return v;
+}
+
+std::vector<uint64_t> mac_chain(const KeyRing& kr, const Path& p, uint64_t nonce) {
+  std::vector<uint64_t> tags;
+  uint64_t prev = nonce;
+  for (const Hop& h : p) {
+    prev = mac_hop(kr, h, prev);
+    tags.push_back(prev);
+  }
+  return tags;
+}
+
+bool mac_verify(const KeyRing& kr, const Path& p, uint64_t nonce,
+                const std::vector<uint64_t>& tags) {
+  std::vector<uint64_t> rec = mac_chain(kr, p, nonce);
+  return rec == tags;
+}
+
+// 基线 B（Atlas 类）：概率采样多路径验证。包以概率 ρ 被验证，检出率 ≈ ρ；
+// 控制器负载 = ρ。MPV-2+CFMV 的负载 = 1/W（W 为流级窗口）且全检出。
+void exp_baseline(int trials) {
+  g_report << "\n## [10] 算法级基线对比（同测试床：同密钥体系、同攻击样本）\n\n";
+
+  // A：逐跳 MAC 链判定时延 vs k（h=7，中位数）
+  g_report << "### 逐跳 MAC 链（Icing 类）vs MPV-2：控制器判定时延 vs k（h=7）\n\n";
+  g_report << "| k | MAC 链逐候选 (µs) | MPV-2 tag (µs) | MPV-2 scan (µs) |\n|---|---|---|---|\n";
+  Rng rng(31);
+  KeyRing kr = KeyRing::generate(16, 4, 20260501);
+  for (uint32_t k : {1u, 2u, 4u, 8u, 16u, 32u, 64u}) {
+    std::vector<Path> cands;
+    for (uint32_t i = 0; i < k; ++i) {
+      Path p;
+      p.push_back(Hop{1, 1, 2});
+      p.push_back(Hop{2, 1, 2});
+      p.push_back(Hop{3, 1, 2});
+      uint32_t x = i;
+      p.push_back(Hop{4 + (x % 11), 1, 2}); x /= 11;
+      p.push_back(Hop{4 + (x % 11), 1, 3});
+      p.push_back(Hop{15, 1, 2});
+      p.push_back(Hop{16, 1, 2});
+      cands.push_back(p);
+    }
+    Header h = forward(kr, cands[k - 1], (uint8_t)((k - 1) & 0xff), rng.nonce());
+    std::vector<uint64_t> tags = mac_chain(kr, cands[k - 1], h.nonce);
+    ExpectationTable tb(kr, cands);
+    std::vector<double> tm, tt, ts;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      for (uint32_t c = 0; c < k; ++c) mac_verify(kr, cands[c], h.nonce, tags);
+      tm.push_back(now_us() - t0);
+      t0 = now_us(); tb.verify_tag(h); tt.push_back(now_us() - t0);
+      t0 = now_us(); tb.verify_scan(h); ts.push_back(now_us() - t0);
+    }
+    g_report << "| " << k << " | " << median(tm) << " | " << median(tt) << " | "
+             << median(ts) << " |\n";
+  }
+  g_report << "- MAC 链每包重放 O(k·h) 次哈希、随 k 线性增长；MPV-2 tag 模式 O(1) "
+              "与 k 无关。MAC 链的验证头为逐跳追加式（8B/跳，h=7 时 63B），头长对比见 [6]。\n";
+
+  // B：概率采样（Atlas 类）：检出率 vs 判定负载。攻击包数 = trials（与 [1] 的
+  // 攻击样本数同义），总包数 = 10 × trials，攻击占比 10%。
+  g_report << "\n### 概率采样多路径（Atlas 类）vs MPV-2+CFMV：漏检率 vs 控制器负载\n\n";
+  const int NPKT = trials * 10;
+  Rng rng2(77);
+  Path p = rand_path(rng2, 7);
+  ExpectationTable tb(kr, std::vector<Path>{p});
+  struct Pkt { uint64_t nonce, acc; bool atk; };
+  std::vector<Pkt> pkts;
+  pkts.reserve(NPKT);
+  int atk_tot = 0;
+  for (int i = 0; i < NPKT; ++i) {
+    bool atk = (i % 10) == 0;  // 10% 攻击包
+    uint64_t nonce = rng2.nonce();
+    Path q = p;
+    if (atk) {
+      ++atk_tot;
+      uint32_t hi = rng2.range(1, (uint32_t)p.size() - 2);
+      q[hi].out_port = (q[hi].out_port % 3) + 1;
+      if (q == p) { q[hi].out_port = q[hi].out_port == 1 ? 2 : 1; }
+    }
+    Header h = forward(kr, q, 0, nonce);
+    pkts.push_back({nonce, h.acc, atk});
+  }
+  g_report << "| 采样率 ρ | 控制器判定负载 | 攻击检出率 | 漏检率 |\n|---|---|---|---|\n";
+  std::vector<std::pair<double, double>> sample_pts;
+  for (double rho : {0.01, 0.05, 0.1, 0.25, 0.5, 1.0}) {
+    uint64_t det = 0, verified = 0;
+    for (const Pkt& pk : pkts) {
+      bool sampled = (h_of(pk.nonce) % 10000) < (uint64_t)(rho * 10000.0);
+      if (!sampled) continue;
+      ++verified;
+      Header h{pk.nonce, pk.acc, 0};
+      if (pk.atk && !tb.verify_tag(h).ok) ++det;
+    }
+    double det_rate = atk_tot ? 100.0 * det / atk_tot : 0;
+    g_report << "| " << rho << " | " << (100.0 * verified / NPKT) << "% | "
+             << det_rate << "% | " << (100 - det_rate) << "% |\n";
+    sample_pts.push_back({rho, 100 - det_rate});
+  }
+  g_report << "| MPV-2+CFMV（W=64） | " << (100.0 / 64) << "% | 100% | 0% |\n";
+  g_report << "- 采样式以漏检换负载：负载降到 1/" << 64 << " 时漏检 "
+           << (100 - 100.0 / 64) << "%；MPV-2+CFMV 用流级聚合把负载降到同一量级且"
+              "全检出（篡改包使所在窗口失衡，[1] 与 [4] 已实测检出与诚实零误报）。\n";
+  std::vector<std::pair<double, double>> cfmv_pts{{1.0 / 64, 0}};
+  std::vector<Series> ss{{"概率采样（漏检≈1−ρ）", "#fbbf24", sample_pts},
+                         {"MPV-2+CFMV（全检出）", "#4ade80", cfmv_pts}};
+  svg_chart("chart_baseline.svg", "控制器判定负载 vs 攻击漏检率（10% 攻击流量）",
+            "判定负载（相对逐包全验证）", "漏检率 %",
+            {"0.01", "0.05", "0.1", "0.25", "0.5", "1.0"},
+            {0.01, 0.05, 0.1, 0.25, 0.5, 1.0}, ss, 105, -3);
+}
+
+// ---------------------------------------------------------------- [11] 规模扩展
+Path path_of_hops(uint32_t hops) {
+  Path p;
+  p.push_back(Hop{1, 1, 2});
+  for (uint32_t i = 0; i + 2 < hops; ++i)
+    p.push_back(Hop{2 + (i % 14), 1, (uint32_t)(2 + (i % 2))});
+  p.push_back(Hop{16, 1, 2});
+  return p;
+}
+
+void exp_hops() {
+  g_report << "\n## [11] 规模扩展：路径跳数 h 下的开销与检出（各 2000 次）\n\n";
+  g_report << "| h | 数据面单跳均摊 (µs) | 期望预计算 (µs) | tag 判定 (µs) | 检出率 |\n|---|---|---|---|---|\n";
+  Rng rng(41);
+  KeyRing kr = KeyRing::generate(16, 4, 20260501);
+  std::vector<double> hs, pre, tag;
+  std::vector<std::string> ticks;
+  for (uint32_t h : {4u, 8u, 16u, 32u}) {
+    Path p = path_of_hops(h);
+    ExpectationTable tb(kr, std::vector<Path>{p});
+    // 数据面：整条 forward，均摊到每跳
+    std::vector<double> tf;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      forward(kr, p, 0, rng.nonce());
+      tf.push_back(now_us() - t0);
+    }
+    // 控制器：期望预计算（流建立时一次）
+    std::vector<double> te;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      expectation(kr, p);
+      te.push_back(now_us() - t0);
+    }
+    // 控制器：tag 判定（每包）
+    Header hh = forward(kr, p, 0, rng.nonce());
+    std::vector<double> tv;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      tb.verify_tag(hh);
+      tv.push_back(now_us() - t0);
+    }
+    // 检出率：改端口 / 旁路 / 改头 三类均匀混合
+    int det = 0, tot = 0;
+    for (int i = 0; i < 2000; ++i) {
+      uint32_t kind = rng.range(0, 2);
+      if (kind == 2) {  // 改头：出口帧翻转一位
+        Header bh = forward(kr, p, 0, rng.nonce());
+        bh.acc ^= 1;
+        ++tot;
+        if (!tb.verify_tag(bh).ok) ++det;
+        continue;
+      }
+      Path bad = (kind == 0) ? atk_out_port(p, rng) : atk_bypass(p, rng);
+      if (bad == p) continue;
+      ++tot;
+      Header bh = forward(kr, bad, 0, rng.nonce());
+      if (!tb.verify_tag(bh).ok) ++det;
+    }
+    double mh = median(tf) / h, me = median(te), mt = median(tv);
+    hs.push_back(h); ticks.push_back(std::to_string(h));
+    pre.push_back(me); tag.push_back(mt);
+    g_report << "| " << h << " | " << mh << " | " << me << " | " << mt << " | "
+             << (tot ? 100.0 * det / tot : 0) << "% |\n";
+  }
+  std::vector<Series> ss{{"期望预计算（流建立一次）", "#fbbf24", {}},
+                         {"tag 判定（每包）", "#4ade80", {}}};
+  for (size_t i = 0; i < hs.size(); ++i) {
+    ss[0].pts.push_back({hs[i], pre[i]});
+    ss[1].pts.push_back({hs[i], tag[i]});
+  }
+  svg_chart("chart_hops.svg", "控制器开销 vs 路径跳数 h", "跳数 h", "µs",
+            ticks, hs, ss, *std::max_element(pre.begin(), pre.end()) * 1.15);
+  g_report << "- 数据面每跳 O(1)（均摊时延不随 h 变化，总时延线性于 h 属逐跳计算固有）"
+              "；控制器 tag 判定与 h 无关（期望已折叠成 A+B·h）；只有流建立时的"
+              "期望预计算随 h 线性——一次性成本。\n";
+}
+
 // ---------------------------------------------------------------- [7] 端到端
 struct RoundStat {
   int rounds = 0, detect_ok = 0, locate_ok = 0, false_pos = 0;
@@ -629,11 +1082,11 @@ int main(int argc, char** argv) {
   g_report << "- 参数：64 位素数域 p = 2^64 − 59；验证头恒定 16 字节\n";
   g_report << "- 本报告由 `exp` 程序一次运行自动生成，所有数字均为实测。\n";
 
-  std::printf("[1/7] 攻击矩阵...\n");  std::fflush(stdout);
+  std::printf("[1/11] 攻击矩阵...\n");  std::fflush(stdout);
   exp_attack_matrix(trials);
-  std::printf("[2/7] 多候选矩阵...\n"); std::fflush(stdout);
+  std::printf("[2/11] 多候选矩阵...\n"); std::fflush(stdout);
   exp_multicand(trials);
-  std::printf("[3/7] 时延 vs k...\n");  std::fflush(stdout);
+  std::printf("[3/11] 时延 vs k...\n");  std::fflush(stdout);
   {
     std::vector<double> ks, tag, scan;
     exp_latency_k(ks, tag, scan);
@@ -648,7 +1101,7 @@ int main(int argc, char** argv) {
     svg_chart("chart_latency_k.svg", "控制器判定时延 vs 候选路径数", "候选路径数",
               "µs", ticks, ks, ss, ymax, 0.15);
   }
-  std::printf("[4/7] 流级与吞吐...\n"); std::fflush(stdout);
+  std::printf("[4/11] 流级与吞吐...\n"); std::fflush(stdout);
   {
     std::vector<double> ns, fl;
     exp_flow(ns, fl);
@@ -660,12 +1113,20 @@ int main(int argc, char** argv) {
     svg_chart("chart_flow_n.svg", "CFMV 流级判定时延 vs 窗口大小（k=16）", "窗口包数 N",
               "µs", ticks, ns, ss, ymax, 0);
   }
-  std::printf("[5/7] 通信开销...\n");  std::fflush(stdout);
+  std::printf("[5/11] 通信开销...\n");  std::fflush(stdout);
   exp_comm();
-  std::printf("[6/7] 头长对比...\n");  std::fflush(stdout);
+  std::printf("[6/11] 头长对比...\n");  std::fflush(stdout);
   exp_header();
-  std::printf("[7/7] 端到端（每场景 %d 轮）...\n", rounds);  std::fflush(stdout);
+  std::printf("[7/11] 端到端（每场景 %d 轮）...\n", rounds);  std::fflush(stdout);
   exp_e2e(rounds, pings);
+  std::printf("[8/11] 存储开销...\n");  std::fflush(stdout);
+  exp_storage();
+  std::printf("[9/11] 定位成功率...\n"); std::fflush(stdout);
+  exp_localization(2000);
+  std::printf("[10/11] 基线对比...\n");  std::fflush(stdout);
+  exp_baseline(trials);
+  std::printf("[11/11] 规模扩展...\n");  std::fflush(stdout);
+  exp_hops();
 
   g_report << "\n---\n\n## 复现命令\n\n```bash\nsudo ./cpp/build/exp --trials " << trials
            << " --rounds " << rounds << " --pings " << pings << "\n```\n";
