@@ -306,6 +306,36 @@ int main(int argc, char** argv) {
     }
   }
 
+  // ------------------------------------------------- 重放窗口微基准（M5.11）
+  // NonceWindow 从 O(W) 线性扫描改为环形缓冲 + 哈希集合 O(1) 判重；
+  // 这里量化容量 4096 下的判重吞吐与重放检出行为。
+  std::printf("\n重放窗口（NonceWindow，容量 4096）\n");
+  {
+    const size_t CAP = 4096;
+    const int OPS = 200000;
+    NonceWindow w(CAP);
+    // 稳态：先灌满窗口
+    for (uint64_t i = 0; i < CAP; ++i) w.see(1 + i);
+    std::vector<double> tv;
+    uint64_t fresh_hits = 0;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      for (int j = 0; j < OPS / 2000; ++j)
+        if (w.see(0x40000000ull + (uint64_t)i * (OPS / 2000) + j)) ++fresh_hits;
+      tv.push_back(now_us() - t0);
+    }
+    double per_fresh = median(tv) * 1000.0 / (OPS / 2000);  // ns/次
+    // 重放检出：重灌窗口后，再喂仍在窗口内的 1000 个 nonce（必须全部判重）
+    for (uint64_t i = 0; i < CAP; ++i) w.see(0x80000000ull + i);
+    int replay_caught = 0;
+    for (uint64_t i = 0; i < 1000; ++i)
+      if (!w.see(0x80000000ull + CAP / 2 + i)) ++replay_caught;
+    std::printf("- 新 nonce 判重插入：%.0f ns/次（200000 次稳态，全部按新接受：%s）\n",
+                per_fresh, fresh_hits == (uint64_t)OPS ? "是" : "否");
+    std::printf("- 窗口内重放检出：%d/1000（容量内必须 100%%）\n", replay_caught);
+    if (replay_caught != 1000) std::printf("  [FAIL] 窗口内重放漏检！\n");
+  }
+
   // ------------------------------------------------- 与已有方案对比（解析口径）
   // 依据各方案公开设计推算，非复现实验；用于论文与演示的口径对齐。
   std::printf("\n与已有路径验证方案对比（解析口径，h=跳数，k=候选路径数，N=窗口包数）\n");

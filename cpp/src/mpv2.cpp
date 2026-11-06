@@ -1,6 +1,7 @@
 #include "mpv2.h"
 
 #include <cstring>
+#include <unordered_set>
 
 #include "blake2b.h"
 
@@ -220,15 +221,36 @@ Verdict ExpectationTable::verify_flow_scan(uint64_t n, uint64_t sum_h,
 }
 
 // ---------------------------------------------------------------- 重放窗口
-// 环形缓冲线性扫描：容量 4096、包速率 ≤ 10^5/s 时，平均扫描 ~2000 次比较，
-// 远小于一次 blake2b；不需要哈希表。
+// 环形缓冲记录到达顺序 + 哈希集合 O(1) 判重。
+// 语义：容量 W 内的重复判为重放；被淘汰的陈旧 nonce 再次出现按新包处理
+// （窗口语义 —— 窗口必须覆盖最大乱序/缓存深度，见设计报告 §13）。
+// 此前的两个缺陷（M5.11 修复）：
+//   * 线性扫描每包 O(W)，10^5 行/秒时 ~2000 次比较；
+//   * `ring_[idx] != 0` 特例使 nonce == 0 的重放永远无法检出。
+struct NonceWindow::Impl {
+  std::unordered_set<uint64_t> live;
+  std::vector<uint64_t> ring;
+  size_t head = 0;
+};
+
+NonceWindow::NonceWindow(size_t capacity)
+    : impl_(new Impl), cap_(capacity ? capacity : 1) {
+  impl_->ring.assign(cap_, 0);
+  impl_->live.reserve(cap_ * 2);
+}
+
+NonceWindow::~NonceWindow() { delete impl_; }
+
 bool NonceWindow::see(uint64_t nonce) {
-  for (size_t i = 0; i < ring_.size(); ++i) {
-    size_t idx = (head_ + i) % ring_.size();
-    if (ring_[idx] == nonce && ring_[idx] != 0) return false;
+  if (impl_->live.count(nonce)) return false;  // 窗口内重复：重放
+  if (n_ < cap_) {
+    ++n_;
+  } else {
+    impl_->live.erase(impl_->ring[impl_->head]);  // 淘汰最旧
   }
-  ring_[head_] = nonce;
-  head_ = (head_ + 1) % ring_.size();
+  impl_->ring[impl_->head] = nonce;
+  impl_->head = (impl_->head + 1) % cap_;
+  impl_->live.insert(nonce);
   return true;
 }
 

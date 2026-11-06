@@ -20,7 +20,12 @@ namespace topo {
 constexpr const char* H1MAC = "00:00:00:00:00:01";
 constexpr const char* H2MAC = "00:00:00:00:00:02";
 constexpr uint64_t SEED = 20260501;
-constexpr const char* WORK = "/tmp/mpv_run";
+
+// 运行目录与 netns 前缀可用环境变量隔离（多实例并行时避免互踩）：
+//     MPV_WORK=/tmp/mpv_dash  MPV_NS=dash-  sudo ./build/dashboard ...
+// 默认 /tmp/mpv_run 与无前缀（h1/h2），行为与此前一致。
+std::string workdir();
+std::string ns_prefix();
 
 // 场景：normal 正常；tagflip 标签错配（s1 把 tag0 改走 P1 分支且全网自洽）；
 // blackhole 路径偏离（s1 把 tag0 改走 s3，s3 无 tag0 表项 → 丢包黑洞）；

@@ -52,7 +52,10 @@ struct DirStat {
 
 class Controller {
  public:
-  Controller(uint64_t seed, const std::vector<Direction>& dirs);
+  // trace_cap：逐跳取证记录的 nonce 条数上界（内存有界；超出后按世代清空，
+  // 旧取证的包退化为候选对比定位）。
+  explicit Controller(uint64_t seed, const std::vector<Direction>& dirs,
+                      size_t trace_cap = 1 << 20);
 
   // 处理一行上报；不是已知格式时返回 kind == "" 的事件
   Event feed(const std::string& line);
@@ -83,6 +86,7 @@ class Controller {
   std::vector<DirStat> stats_;
   std::vector<NonceWindow> windows_;
   std::unordered_map<std::string, std::vector<HopTrace>> traces_;
+  size_t trace_cap_;
 };
 
 }  // namespace mpv

@@ -32,6 +32,7 @@
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <poll.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -81,6 +82,21 @@ struct PairHash {
            (std::hash<std::string>()(p.second) << 1);
   }
 };
+
+// nonce 来源：内核 CSPRNG（getrandom）。
+// 此前用 srand(seed^sid)+rand()：同 seed 每次启动产生完全相同的 nonce 序列，
+// 而验证头只依赖 (nonce, 路径, 密钥) —— 上一轮运行录制的帧在控制器重启
+// （重放窗口清空）之后可以永久重放且必然通过判定。CSPRNG 保证跨启动不重复。
+uint64_t fresh_nonce() {
+  uint64_t v = 0;
+  while (::getrandom(&v, sizeof(v), 0) != (ssize_t)sizeof(v)) {
+    if (errno != EINTR) {
+      std::perror("getrandom");
+      std::_Exit(2);
+    }
+  }
+  return v & ((1ULL << 56) - 1);  // nonce 空间 56 bit
+}
 
 enum class Evil { kNone, kBitflip, kDup };
 
@@ -244,8 +260,7 @@ class VSwitch {
     hop.in_port = (uint32_t)in_idx;
 
     if (!shimmed) {
-      nonce = 0;
-      for (int i = 0; i < 7; ++i) nonce = (nonce << 8) | (uint8_t)(rand() & 0xff);
+      nonce = fresh_nonce();
       Header h = ingress(kr_, hop, tag, nonce);
       acc = h.acc;
     } else {
@@ -418,7 +433,6 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  std::srand((unsigned)(seed ^ (sid * 2654435761u)));
   VSwitch sw(sid, seed, table, report, std::move(ports), paths, force_tag,
              emode, trace, flow_window);
   sw.set_debug(debug);

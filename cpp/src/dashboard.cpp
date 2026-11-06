@@ -809,7 +809,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "找不到交换机程序: %s（先 make）\n", g_vswitch.c_str());
     return 2;
   }
-  ::mkdir(WORK, 0755);
+  ::mkdir(workdir().c_str(), 0755);
 
   g_started = mono_s();
   setup_links();

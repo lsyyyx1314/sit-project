@@ -17,8 +17,11 @@ double now_us() {
 
 }  // namespace
 
-Controller::Controller(uint64_t seed, const std::vector<Direction>& dirs)
-    : kr_(KeyRing::generate(16, 4, seed)), dirs_(dirs) {
+Controller::Controller(uint64_t seed, const std::vector<Direction>& dirs,
+                       size_t trace_cap)
+    : kr_(KeyRing::generate(16, 4, seed)),
+      dirs_(dirs),
+      trace_cap_(trace_cap ? trace_cap : 1) {
   tables_.reserve(dirs.size());
   stats_.resize(dirs.size());
   windows_.resize(dirs.size());
@@ -146,6 +149,8 @@ Event Controller::feed_trace(std::istringstream& ss) {
     return ev;
   traces_[std::string(mac) + "|" + std::to_string(nonce)].push_back(
       HopTrace{sid, in_p, out_p, pos, v_after});
+  // 内存上界：长期在线时取证按世代清空（旧取证的包退化为候选对比定位）
+  if (traces_.size() > trace_cap_) traces_.clear();
   return ev;  // kind == ""，trace 不产生判定事件
 }
 
@@ -172,8 +177,8 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
   uint64_t hh = h_of(nonce);
   if (it == traces_.end() || it->second.empty()) {
     // 无取证：候选对比，声称路径与实际命中路径的首个分歧交换机
-    ExpectationTable tb(kr_, dirs_[dir].paths);
-    Verdict sc = tb.verify_scan(Header{nonce, acc, tag});
+    // （复用已构建的期望表；此前此处每次重建 O(k·h)，纯浪费）
+    Verdict sc = tables_[dir].verify_scan(Header{nonce, acc, tag});
     if (sc.matched < 0) return out;
     const Path& actual = dirs_[dir].paths[(size_t)sc.matched];
     size_t common = 0;

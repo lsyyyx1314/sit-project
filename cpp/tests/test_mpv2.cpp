@@ -6,10 +6,12 @@
 //   2. 功能与对抗断言 —— 顺序绑定、篡改检出、候选集判定、流级聚合。
 //
 // 运行： ./build/tests ../results/golden_vectors.txt
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -263,6 +265,47 @@ static void flow_tests() {
   for (uint64_t i = 0; i < 63; ++i) all_new = all_new && w.see(700 + i);
   CHECK(all_new, "窗口未满时新 nonce 全部接受");
   CHECK(!w.see(12345), "未滑出窗口的重复仍被拒绝");
+
+  // M5.11 加固：nonce == 0 必须同样判重（旧实现对 0 有特例，重放永远被接受）
+  {
+    NonceWindow z(8);
+    CHECK(z.see(0), "nonce=0 首次接受");
+    CHECK(!z.see(0), "nonce=0 重复必须拒绝（旧实现存在绕过）");
+  }
+
+  // 容量语义：新包进入触发淘汰，被淘汰的陈旧 nonce 再次出现按新包处理
+  {
+    NonceWindow c(4);
+    CHECK(c.see(1) && c.see(2) && c.see(3) && c.see(4), "容量 4 填满");
+    CHECK(!c.see(1), "窗口未滑出前，最旧 nonce 仍判重");
+    CHECK(c.see(5), "新 nonce 进入并淘汰最旧");
+    CHECK(c.see(1), "被淘汰的最旧 nonce 视为新包（窗口语义）");
+    CHECK(!c.see(1), "重新进入窗口后再次重复仍拒绝");
+    CHECK(!c.see(5), "未被淘汰的 nonce 仍判重");
+  }
+
+  // 影子模型随机对照：窗口语义与朴素向量实现逐操作一致（10000 次）
+  {
+    NonceWindow w2(64);
+    std::vector<uint64_t> shadow;  // 朴素实现：向量存最近 ≤64 个 nonce
+    std::mt19937_64 rng(2026);
+    bool agree = true;
+    for (int i = 0; i < 10000 && agree; ++i) {
+      uint64_t n = rng() % 200;  // 小值域，制造大量重复
+      auto it = std::find(shadow.begin(), shadow.end(), n);
+      bool expect_new = (it == shadow.end());
+      bool got = w2.see(n);
+      if (got != expect_new) {
+        agree = false;
+        break;
+      }
+      if (expect_new) {
+        shadow.push_back(n);
+        if (shadow.size() > 64) shadow.erase(shadow.begin());
+      }
+    }
+    CHECK(agree, "NonceWindow 与朴素窗口模型 10000 次随机操作一致");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +425,42 @@ static void controller_tests() {
   CHECK(ev.kind == "flow" && ev.ok, "FLOW 行流级判定通过");
   const DirStat& st = ctl.stat(0);
   CHECK_EQ(st.cfmv_checks, 1, "流级判定仅 1 次");
+
+  // 无取证回退：候选对比定位（M5.11 起复用已构建的期望表）
+  {
+    Controller c2(SEED, dirs);
+    Header hp1 = forward(kr, p1, 0, 3333);  // 实际走 p1，却声称 tag 0
+    std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
+                  (unsigned long long)hp1.nonce, (unsigned long long)hp1.acc,
+                  MAC);
+    Event evc = c2.feed(line);
+    CHECK(!evc.ok, "tag 错配包被拒（无取证）");
+    CHECK_EQ(evc.suspects.empty() ? -1 : evc.suspects[0], 1,
+             "无取证候选对比定位到路由分歧点 s1");
+  }
+
+  // 取证内存上界：trace_cap 溢出按世代清空，判定功能保持正常、不崩溃
+  {
+    Controller c3(SEED, dirs, 2);  // 上界 2 条 nonce 取证
+    for (uint64_t n : {5001, 5002, 5003, 5004}) {
+      uint64_t hn = h_of(n), et = 0;
+      for (size_t j = 0; j < p0.size(); ++j) {
+        et = addmod(et, mulmod(contribution(kr, p0[j], hn), powmod(RHO, (uint64_t)j)));
+        char tl[160];
+        std::snprintf(tl, sizeof(tl), "TRACE %s %u %u %u 0 %llu %zu %llu", MAC,
+                      p0[j].sid, p0[j].in_port, p0[j].out_port, n, j + 1,
+                      (unsigned long long)et);
+        c3.feed(tl);
+      }
+    }
+    Header bad2 = forward(kr, p0, 0, 6000);
+    bad2.acc ^= 1;
+    std::snprintf(line, sizeof(line), "4 0 %llu %llu %s",
+                  (unsigned long long)bad2.nonce, (unsigned long long)bad2.acc,
+                  MAC);
+    Event evc = c3.feed(line);
+    CHECK(!evc.ok, "取证上界溢出后判定功能正常");
+  }
 }
 
 int main(int argc, char** argv) {

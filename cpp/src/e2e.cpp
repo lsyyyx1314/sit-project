@@ -136,7 +136,7 @@ int main() {
     std::fprintf(stderr, "找不到交换机程序: %s（先 make）\n", g_vswitch.c_str());
     return 2;
   }
-  ::mkdir(WORK, 0755);
+  ::mkdir(topo::workdir().c_str(), 0755);
 
   std::printf("================================================================\n");
   std::printf("MPV-2 端到端验证 · C++ 软件交换机 4 台 · 七轮场景\n");

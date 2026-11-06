@@ -139,15 +139,39 @@ struct FlowAgg {
 // 定长窗口记录最近见过的 nonce；see() 返回 false 表示重放。
 // CFMV 的聚合是可加的，重放一个合法包能同时加大三元组 —— 因此流级判定
 // 必须配合 nonce 窗口去重才安全。
+// 实现：环形缓冲记录到达顺序（用于老化淘汰）+ 哈希集合做 O(1) 判重；
+// 容量外的陈旧 nonce 淘汰后再次出现按新包处理（窗口语义，见设计报告 §13）。
 class NonceWindow {
  public:
-  explicit NonceWindow(size_t capacity = 4096) : ring_(capacity) {}
+  explicit NonceWindow(size_t capacity = 4096);
+  ~NonceWindow();
+  NonceWindow(const NonceWindow&) = delete;
+  NonceWindow& operator=(const NonceWindow&) = delete;
+  NonceWindow(NonceWindow&& o) noexcept
+      : impl_(o.impl_), cap_(o.cap_), n_(o.n_) {
+    o.impl_ = nullptr;
+    o.n_ = 0;
+  }
+  NonceWindow& operator=(NonceWindow&& o) noexcept {
+    if (this != &o) {
+      delete impl_;
+      impl_ = o.impl_;
+      cap_ = o.cap_;
+      n_ = o.n_;
+      o.impl_ = nullptr;
+      o.n_ = 0;
+    }
+    return *this;
+  }
   // 首次出现返回 true；窗口内的重复返回 false。
   bool see(uint64_t nonce);
+  size_t size() const { return n_; }
 
  private:
-  std::vector<uint64_t> ring_;
-  size_t head_ = 0;
+  struct Impl;            // unordered_set 需要完整类型，实现藏在 .cpp
+  Impl* impl_;
+  size_t cap_;
+  size_t n_ = 0;
 };
 
 }  // namespace mpv

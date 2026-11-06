@@ -40,14 +40,28 @@ void veth(const std::string& host, const std::string& sw, const std::string& ns)
 
 }  // namespace
 
-std::string table_path(int sid) {
-  return std::string(WORK) + "/s" + std::to_string(sid) + ".tbl";
+std::string workdir() {
+  const char* e = ::getenv("MPV_WORK");
+  return (e && *e) ? std::string(e) : "/tmp/mpv_run";
 }
-std::string report_path() { return std::string(WORK) + "/report.txt"; }
-std::string trace_path() { return std::string(WORK) + "/trace.txt"; }
+
+std::string ns_prefix() {
+  const char* e = ::getenv("MPV_NS");
+  return (e && *e) ? std::string(e) : "";
+}
+
+// 全程使用带前缀的 ns 名，避免多实例互删对方的命名空间
+std::string nsname(const char* base) { return ns_prefix() + base; }
+
+std::string table_path(int sid) {
+  return workdir() + "/s" + std::to_string(sid) + ".tbl";
+}
+std::string report_path() { return workdir() + "/report.txt"; }
+std::string trace_path() { return workdir() + "/trace.txt"; }
 
 void cleanup() {
-  for (const char* ns : {"h1", "h2"}) sh(std::string("ip netns del ") + ns);
+  for (const char* ns : {"h1", "h2"})
+    sh(std::string("ip netns del ") + nsname(ns));
   for (const char* i : {"s1p1", "s1p2", "s1p3", "s2p1", "s2p2", "s3p1", "s3p2",
                         "s4p1", "s4p2", "s4p3", "h1e", "h2e"})
     sh(std::string("ip link del ") + i);
@@ -55,29 +69,32 @@ void cleanup() {
 
 void setup_links() {
   cleanup();
-  must("ip netns add h1");
-  must("ip netns add h2");
-  for (const char* ns : {"h1", "h2"})
-    sh(std::string("ip netns exec ") + ns +
+  for (const char* base : {"h1", "h2"}) must("ip netns add " + nsname(base));
+  for (const char* base : {"h1", "h2"})
+    sh(std::string("ip netns exec ") + nsname(base) +
        " sysctl -qw net.ipv6.conf.all.disable_ipv6=1");
 
-  veth("h1e", "s1p1", "h1");
+  veth("h1e", "s1p1", nsname("h1"));
   veth("s1p2", "s2p1", "");
   veth("s1p3", "s3p1", "");
   veth("s2p2", "s4p1", "");
   veth("s3p2", "s4p2", "");
-  veth("h2e", "s4p3", "h2");
+  veth("h2e", "s4p3", nsname("h2"));
 
-  must(std::string("ip netns exec h1 ip link set h1e address ") + H1MAC);
-  must(std::string("ip netns exec h2 ip link set h2e address ") + H2MAC);
-  must("ip netns exec h1 ip addr add 10.0.0.1/24 dev h1e");
-  must("ip netns exec h2 ip addr add 10.0.0.2/24 dev h2e");
-  must("ip netns exec h1 ip link set lo up");
-  must("ip netns exec h2 ip link set lo up");
-  must(std::string("ip netns exec h1 ip neigh replace 10.0.0.2 lladdr ") +
-       H2MAC + " dev h1e");
-  must(std::string("ip netns exec h2 ip neigh replace 10.0.0.1 lladdr ") +
-       H1MAC + " dev h2e");
+  must(std::string("ip netns exec ") + nsname("h1") +
+       " ip link set h1e address " + H1MAC);
+  must(std::string("ip netns exec ") + nsname("h2") +
+       " ip link set h2e address " + H2MAC);
+  must(std::string("ip netns exec ") + nsname("h1") +
+       " ip addr add 10.0.0.1/24 dev h1e");
+  must(std::string("ip netns exec ") + nsname("h2") +
+       " ip addr add 10.0.0.2/24 dev h2e");
+  must(std::string("ip netns exec ") + nsname("h1") + " ip link set lo up");
+  must(std::string("ip netns exec ") + nsname("h2") + " ip link set lo up");
+  must(std::string("ip netns exec ") + nsname("h1") +
+       " ip neigh replace 10.0.0.2 lladdr " + H2MAC + " dev h1e");
+  must(std::string("ip netns exec ") + nsname("h2") +
+       " ip neigh replace 10.0.0.1 lladdr " + H1MAC + " dev h2e");
 }
 
 void write_tables(Scenario sc) {
@@ -190,8 +207,8 @@ void stop_switch(pid_t pid) {
 }
 
 void run_traffic(int count, const std::string& interval) {
-  sh("ip netns exec h1 ping -c " + std::to_string(count) + " -i " + interval +
-     " -W 1 10.0.0.2 >/dev/null");
+  sh("ip netns exec " + nsname("h1") + " ping -c " + std::to_string(count) +
+     " -i " + interval + " -W 1 10.0.0.2 >/dev/null");
 }
 
 std::vector<mpv::Path> cand_fwd() {

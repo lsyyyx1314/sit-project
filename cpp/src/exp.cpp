@@ -1070,7 +1070,7 @@ int main(int argc, char** argv) {
   }
   ::mkdir("results", 0755);
   ::mkdir(g_chart_dir.c_str(), 0755);
-  ::mkdir(WORK, 0755);
+  ::mkdir(topo::workdir().c_str(), 0755);
 
   g_report.open("results/exp_report.md");
   if (!g_report) {
