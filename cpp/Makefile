@@ -34,7 +34,7 @@ $(BUILD)/dashboard: src/dashboard.cpp $(SRC_CORE) $(SRC_NET) $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -o $@ $< $(SRC_CORE) $(SRC_NET) -pthread
 
 $(BUILD)/exp: src/exp.cpp $(SRC_CORE) $(SRC_NET) $(HDRS) | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $< $(SRC_CORE) $(SRC_NET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(SRC_CORE) $(SRC_NET) -pthread
 
 test: $(BUILD)/tests
 	./$(BUILD)/tests tests/golden_vectors.txt

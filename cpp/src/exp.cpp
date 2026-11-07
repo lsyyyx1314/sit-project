@@ -27,6 +27,7 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <thread>
 #include <set>
 #include <sstream>
 #include <string>
@@ -43,6 +44,7 @@ using namespace topo;
 namespace {
 
 std::ofstream g_report;
+int g_nthr = 2;  // 并行线程数（--threads；默认取 CPU 核数）
 std::string g_chart_dir = "results/charts";
 
 std::string exe_dir() {
@@ -167,94 +169,159 @@ Path atk_bypass(const Path& p, Rng& r) { Path q = p; uint32_t i = r.range(1, (ui
 Path atk_reorder(const Path& p, Rng& r) { Path q = p; if (q.size() < 4) return q; uint32_t i = r.range(1, (uint32_t)q.size() - 3); std::swap(q[i], q[i + 1]); return q; }
 Path atk_delete(const Path& p, Rng& r) { Path q = p; if (q.size() < 4) return q; q.erase(q.begin() + r.range(1, (uint32_t)q.size() - 2)); return q; }
 Path atk_insert(const Path& p, Rng& r) { Path q = p; uint32_t pos = r.range(1, (uint32_t)q.size() - 1); q.insert(q.begin() + pos, Hop{r.range(2, 15), 1, 3}); return q; }
-Path atk_replace(const Path& p, Rng& r) { Path q; q.push_back(p.front()); for (size_t i = 1; i + 1 < p.size(); ++i) q.push_back(Hop{r.range(2, 15), 1, 2}); q.push_back(p.back()); return q; }
+Path atk_replace(const Path& p, Rng& r) { Path q = p; q.push_back(p.front()); for (size_t i = 1; i + 1 < p.size(); ++i) q.push_back(Hop{r.range(2, 15), 1, 2}); q.push_back(p.back()); return q; }
 Path atk_truncate(const Path& p, Rng&) { Path q = p; if (q.size() > 2) q.pop_back(); return q; }
 
-int exp_attack_matrix(int trials) {
-  g_report << "\n## [1] 十类攻击检出矩阵（每组 " << trials << " 次，64 位模域）\n\n";
-  g_report << "| 编号 | 攻击手法 | 检出/样本 | 检出率 |\n|---|---|---|---|\n";
-  Rng rng(20260501);
-  KeyRing kr = KeyRing::generate(16, 4, 20260501);
-  struct Row { const char* code; const char* name; int det = 0, tot = 0; };
-  std::vector<Row> rows = {{"S1","改出端口"},{"S2","改入端口"},{"S3","交换机旁路"},
-                           {"S4","跳序交换"},{"S5","删除一跳"},{"S6","插入一跳"},
-                           {"S7","整条替换"},{"S8","截断路径"}};
+struct MatrixStat {
+  int det[8] = {0}, tot[8] = {0};
   int honest = 0;
+  int flip_t = 0, flip_d = 0, forge_t = 0, forge_d = 0;
+};
+
+// 单个 worker：独立 RNG 与 KeyRing（备忘录缓存非线程安全，每线程一份——
+// 同 seed 派生同密钥，统计性质与单线程一致）
+void matrix_worker(int tid, int trials, MatrixStat& st) {
+  Rng rng(20260501 + 0x9E3779B97F4A7C15ULL * (uint64_t)(tid + 1));
+  KeyRing kr = KeyRing::generate(16, 4, 20260501);
   for (int t = 0; t < trials; ++t) {
     Path p = rand_path(rng, rng.range(3, 7));
     Header h = forward(kr, p, 0, rng.nonce());
     std::vector<Path> one{p};
     ExpectationTable tb(kr, one);
-    if (tb.verify_tag(h).ok) ++honest;
+    if (tb.verify_tag(h).ok) ++st.honest;
     Path bad[8] = {atk_out_port(p, rng), atk_in_port(p, rng), atk_bypass(p, rng),
                    atk_reorder(p, rng), atk_delete(p, rng), atk_insert(p, rng),
                    atk_replace(p, rng), atk_truncate(p, rng)};
     for (int a = 0; a < 8; ++a) {
       if (bad[a] == p) continue;
-      ++rows[a].tot;
+      ++st.tot[a];
       Header bh = forward(kr, bad[a], 0, rng.nonce());
-      if (!tb.verify_tag(bh).ok) ++rows[a].det;
+      if (!tb.verify_tag(bh).ok) ++st.det[a];
+    }
+    // 数据性攻击：比特翻转 + 随机伪造
+    Header f = h;
+    f.acc ^= 1;
+    ++st.flip_t;
+    if (!tb.verify_tag(f).ok) ++st.flip_d;
+    Path g = rand_path(rng, rng.range(3, 7));
+    if (!(g == p)) {
+      ++st.forge_t;
+      Header gh = forward(kr, g, 0, rng.nonce());
+      if (!tb.verify_tag(gh).ok) ++st.forge_d;
     }
   }
-  int flip_t = 0, flip_d = 0, forge_t = 0, forge_d = 0;
-  for (int t = 0; t < trials; ++t) {
-    Path p = rand_path(rng, rng.range(3, 7));
-    Header h = forward(kr, p, 0, rng.nonce());
-    std::vector<Path> one{p};
-    ExpectationTable tb(kr, one);
-    Header f = h; f.acc ^= 1;
-    ++flip_t; if (!tb.verify_tag(f).ok) ++flip_d;
-    Path g = rand_path(rng, rng.range(3, 7));
-    if (!(g == p)) { ++forge_t; Header gh = forward(kr, g, 0, rng.nonce()); if (!tb.verify_tag(gh).ok) ++forge_d; }
+}
+
+int exp_attack_matrix(int trials, int nthr) {
+  g_report << "\n## [1] 十类攻击检出矩阵（每组 " << trials << " 次，64 位模域，"
+           << nthr << " 线程）\n\n";
+  g_report << "| 编号 | 攻击手法 | 检出/样本 | 检出率 |\n|---|---|---|---|\n";
+
+  // 单线程基线（加速比证据，同一 worker 不同线程数）
+  double ts0 = now_us();
+  {
+    MatrixStat single;
+    matrix_worker(0, trials, single);
   }
-  for (auto& r : rows)
-    g_report << "| " << r.code << " | " << r.name << " | " << r.det << "/" << r.tot
-             << " | " << (r.tot ? 100.0 * r.det / r.tot : 0) << "% |\n";
-  g_report << "| S9 | 验证头比特翻转 | " << flip_d << "/" << flip_t << " | "
-           << 100.0 * flip_d / flip_t << "% |\n";
-  g_report << "| S10 | 随机伪造验证头 | " << forge_d << "/" << forge_t << " | "
-           << 100.0 * forge_d / forge_t << "% |\n";
-  g_report << "\n诚实样本接受率：" << (100.0 * honest / trials) << "%（" << honest
-           << "/" << trials << "）\n";
+  double single_el = now_us() - ts0;
+
+  std::vector<MatrixStat> stats(nthr);
+  std::vector<std::thread> ths;
+  int per = (trials + nthr - 1) / nthr;
+  double t0 = now_us();
+  for (int t = 0; t < nthr; ++t) {
+    int n = (t == nthr - 1) ? trials - per * (nthr - 1) : per;
+    ths.emplace_back([t, n, &stats] { matrix_worker(t, n, stats[t]); });
+  }
+  for (auto& th : ths) th.join();
+  double par_el = now_us() - t0;
+
+  MatrixStat st;
+  for (const MatrixStat& s : stats) {
+    st.honest += s.honest;
+    for (int a = 0; a < 8; ++a) {
+      st.tot[a] += s.tot[a];
+      st.det[a] += s.det[a];
+    }
+    st.flip_t += s.flip_t; st.flip_d += s.flip_d;
+    st.forge_t += s.forge_t; st.forge_d += s.forge_d;
+  }
+  struct Row { const char* code; const char* name; };
+  Row rows[8] = {{"S1","改出端口"},{"S2","改入端口"},{"S3","交换机旁路"},
+                 {"S4","跳序交换"},{"S5","删除一跳"},{"S6","插入一跳"},
+                 {"S7","整条替换"},{"S8","截断路径"}};
+  for (int a = 0; a < 8; ++a)
+    g_report << "| " << rows[a].code << " | " << rows[a].name << " | " << st.det[a]
+             << "/" << st.tot[a] << " | "
+             << (st.tot[a] ? 100.0 * st.det[a] / st.tot[a] : 0) << "% |\n";
+  g_report << "| S9 | 验证头比特翻转 | " << st.flip_d << "/" << st.flip_t << " | "
+           << 100.0 * st.flip_d / st.flip_t << "% |\n";
+  g_report << "| S10 | 随机伪造验证头 | " << st.forge_d << "/" << st.forge_t
+           << " | " << 100.0 * st.forge_d / st.forge_t << "% |\n";
+  g_report << "\n诚实样本接受率：" << (100.0 * st.honest / trials) << "%（"
+           << st.honest << "/" << trials << "）\n";
+  g_report << "- 并发：" << nthr << " 线程 " << par_el / 1000.0 << " s vs 单线程 "
+           << single_el / 1000.0 << " s（加速比 " << single_el / par_el << "×，"
+           << "两轮独立 RNG，统计同性质）\n";
   return 0;
 }
 
 // ---------------------------------------------------------------- [2] 多候选
-void exp_multicand(int trials) {
-  g_report << "\n## [2] 多候选集下的攻击检出与诚实接受（k 条合法路径共用期望表）\n\n";
-  g_report << "| k | 诚实接受 | 篡改检出 |\n|---|---|---|\n";
-  Rng rng(99);
+struct CandStat {
+  int ho = 0, ho_t = 0, de = 0, de_t = 0;
+};
+
+void cand_worker(int tid, int trials, uint32_t k, CandStat& st) {
+  Rng rng(99 + 0x9E3779B97F4A7C15ULL * (uint64_t)(tid + 1));
   KeyRing kr = KeyRing::generate(16, 4, 20260501);
+  std::vector<Path> cands;
+  for (uint32_t i = 0; i < k; ++i) {
+    Path p;
+    p.push_back(Hop{1, 1, 2});
+    p.push_back(Hop{2 + (i % 14), 1, 2});
+    p.push_back(Hop{9 + (i % 7), 1, 3});
+    p.push_back(Hop{13 + (i % 3), 1, 2});
+    p.push_back(Hop{16, 1, 2});
+    cands.push_back(p);
+  }
+  ExpectationTable tb(kr, cands);
+  for (int t = 0; t < trials; ++t) {
+    uint32_t pick = rng.range(0, k - 1);
+    uint64_t nonce = rng.nonce();
+    Header h = forward(kr, cands[pick], (uint8_t)pick, nonce);
+    ++st.ho_t;
+    if (tb.verify_tag(h).ok) ++st.ho;
+    Path bad = cands[pick];
+    uint32_t hi = rng.range(1, 3);
+    bad[hi].out_port = (bad[hi].out_port % 3) + 1;
+    if (!(bad == cands[pick])) {
+      ++st.de_t;
+      Header bh = forward(kr, bad, (uint8_t)pick, nonce);
+      if (!tb.verify_tag(bh).ok && tb.verify_scan(bh).matched < 0) ++st.de;
+    }
+  }
+}
+
+void exp_multicand(int trials, int nthr) {
+  g_report << "\n## [2] 多候选集下的攻击检出与诚实接受（k 条合法路径共用期望表，"
+           << nthr << " 线程）\n\n";
+  g_report << "| k | 诚实接受 | 篡改检出 |\n|---|---|---|\n";
   for (uint32_t k : {2u, 8u, 16u}) {
-    std::vector<Path> cands;
-    for (uint32_t i = 0; i < k; ++i) {
-      Path p;
-      p.push_back(Hop{1, 1, 2});
-      p.push_back(Hop{2 + (i % 14), 1, 2});
-      p.push_back(Hop{9 + (i % 7), 1, 3});
-      p.push_back(Hop{13 + (i % 3), 1, 2});
-      p.push_back(Hop{16, 1, 2});
-      cands.push_back(p);
+    std::vector<CandStat> stats(nthr);
+    std::vector<std::thread> ths;
+    int per = (trials + nthr - 1) / nthr;
+    for (int t = 0; t < nthr; ++t) {
+      int n = (t == nthr - 1) ? trials - per * (nthr - 1) : per;
+      ths.emplace_back([t, n, k, &stats] { cand_worker(t, n, k, stats[t]); });
     }
-    ExpectationTable tb(kr, cands);
-    int ho = 0, ho_t = 0, de = 0, de_t = 0;
-    for (int t = 0; t < trials; ++t) {
-      uint32_t pick = rng.range(0, k - 1);
-      uint64_t nonce = rng.nonce();
-      Header h = forward(kr, cands[pick], (uint8_t)pick, nonce);
-      ++ho_t; if (tb.verify_tag(h).ok) ++ho;
-      Path bad = cands[pick];
-      uint32_t hi = rng.range(1, 3);
-      bad[hi].out_port = (bad[hi].out_port % 3) + 1;
-      if (!(bad == cands[pick])) {
-        ++de_t;
-        Header bh = forward(kr, bad, (uint8_t)pick, nonce);
-        if (!tb.verify_tag(bh).ok && tb.verify_scan(bh).matched < 0) ++de;
-      }
+    for (auto& th : ths) th.join();
+    CandStat st;
+    for (const CandStat& s : stats) {
+      st.ho += s.ho; st.ho_t += s.ho_t; st.de += s.de; st.de_t += s.de_t;
     }
-    g_report << "| " << k << " | " << 100.0 * ho / ho_t << "%（" << ho << "/" << ho_t
-             << "） | " << 100.0 * de / (de_t ? de_t : 1) << "%（" << de << "/" << de_t
-             << "） |\n";
+    g_report << "| " << k << " | " << 100.0 * st.ho / st.ho_t << "%（" << st.ho
+             << "/" << st.ho_t << "） | " << 100.0 * st.de / (st.de_t ? st.de_t : 1)
+             << "%（" << st.de << "/" << st.de_t << "） |\n";
   }
 }
 
@@ -433,7 +500,9 @@ void exp_storage() {
     size_t x = (size_t)k * 7 * sizeof(Hop);                // 索引：sid+in+out 12B/跳
     g_report << "| " << k << " | " << e << " | " << x << " | " << e + x << " |\n";
   }
-  g_report << "- nonce 重放窗口：每方向固定 " << 4096 * 8 << " B（容量 4096，与速率无关）\n";
+  g_report << "- nonce 重放窗口：每方向 "
+           << (4096 * 8 + 8192 * 4 + 4096 * 4) << " B（环 32KB + 开链桶 32KB + 链 16KB，"
+              "平坦无逐条目分配；容量 4096，与速率无关）\n";
   g_report << "- 对照：逐跳 MAC 链基线无预计算表，但每包判定需 O(k·h) 次哈希（见 [10]）"
               "——以计算换存储，本方案把两边同时做成 O(k)/O(1)。\n";
 
@@ -741,7 +810,7 @@ void exp_baseline(int trials) {
   Rng rng2(77);
   Path p = rand_path(rng2, 7);
   ExpectationTable tb(kr, std::vector<Path>{p});
-  struct Pkt { uint64_t nonce, acc; bool atk; };
+  struct Pkt { uint64_t nonce, acc, hh; bool atk; };
   std::vector<Pkt> pkts;
   pkts.reserve(NPKT);
   int atk_tot = 0;
@@ -756,23 +825,41 @@ void exp_baseline(int trials) {
       if (q == p) { q[hi].out_port = q[hi].out_port == 1 ? 2 : 1; }
     }
     Header h = forward(kr, q, 0, nonce);
-    pkts.push_back({nonce, h.acc, atk});
+    pkts.push_back({nonce, h.acc, h_of(nonce), atk});
   }
   g_report << "| 采样率 ρ | 控制器判定负载 | 攻击检出率 | 漏检率 |\n|---|---|---|---|\n";
-  std::vector<std::pair<double, double>> sample_pts;
-  for (double rho : {0.01, 0.05, 0.1, 0.25, 0.5, 1.0}) {
-    uint64_t det = 0, verified = 0;
-    for (const Pkt& pk : pkts) {
-      bool sampled = (h_of(pk.nonce) % 10000) < (uint64_t)(rho * 10000.0);
-      if (!sampled) continue;
-      ++verified;
-      Header h{pk.nonce, pk.acc, 0};
-      if (pk.atk && !tb.verify_tag(h).ok) ++det;
+  // 各 ρ 的采样循环相互独立：多线程并行（pkts 只读，期望表只读）
+  const double rhos[6] = {0.01, 0.05, 0.1, 0.25, 0.5, 1.0};
+  std::vector<uint64_t> v_cnt(6, 0), d_cnt(6, 0);
+  {
+    std::vector<std::thread> ths;
+    int per = (6 + g_nthr - 1) / g_nthr;
+    for (int t = 0; t < g_nthr; ++t) {
+      int lo = t * per, hi = lo + per;
+      if (hi > 6) hi = 6;
+      if (lo >= hi) break;
+      ths.emplace_back([lo, hi, &pkts, &tb, &rhos, &v_cnt, &d_cnt] {
+        for (int ri = lo; ri < hi; ++ri) {
+          uint64_t det = 0, verified = 0;
+          for (const Pkt& pk : pkts) {
+            if ((pk.hh % 10000) >= (uint64_t)(rhos[ri] * 10000.0)) continue;
+            ++verified;
+            Header h{pk.nonce, pk.acc, 0};
+            if (pk.atk && !tb.verify_tag(h).ok) ++det;
+          }
+          v_cnt[ri] = verified;
+          d_cnt[ri] = det;
+        }
+      });
     }
-    double det_rate = atk_tot ? 100.0 * det / atk_tot : 0;
-    g_report << "| " << rho << " | " << (100.0 * verified / NPKT) << "% | "
+    for (auto& th : ths) th.join();
+  }
+  std::vector<std::pair<double, double>> sample_pts;
+  for (int ri = 0; ri < 6; ++ri) {
+    double det_rate = atk_tot ? 100.0 * d_cnt[ri] / atk_tot : 0;
+    g_report << "| " << rhos[ri] << " | " << (100.0 * v_cnt[ri] / NPKT) << "% | "
              << det_rate << "% | " << (100 - det_rate) << "% |\n";
-    sample_pts.push_back({rho, 100 - det_rate});
+    sample_pts.push_back({rhos[ri], 100 - det_rate});
   }
   g_report << "| MPV-2+CFMV（W=64） | " << (100.0 / 64) << "% | 100% | 0% |\n";
   g_report << "- 采样式以漏检换负载：负载降到 1/" << 64 << " 时漏检 "
@@ -1061,12 +1148,13 @@ void exp_e2e(int rounds, int pings) {
 
 // ---------------------------------------------------------------- main
 int main(int argc, char** argv) {
-  int trials = 10000, rounds = 5, pings = 20, flood = 0;
+  int trials = 10000, rounds = 5, pings = 20, flood = 0, nthr = 0;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--trials") trials = std::atoi(argv[++i]);
     else if (a == "--rounds") rounds = std::atoi(argv[++i]);
     else if (a == "--pings") pings = std::atoi(argv[++i]);
+    else if (a == "--threads") nthr = std::atoi(argv[++i]);
     else if (a == "--flood") flood = std::atoi(argv[++i]);
   }
   if (::geteuid() != 0) {
@@ -1080,6 +1168,9 @@ int main(int argc, char** argv) {
   ::mkdir("results", 0755);
   ::mkdir(g_chart_dir.c_str(), 0755);
   ::mkdir(topo::workdir().c_str(), 0755);
+  g_nthr = nthr > 0 ? nthr : (int)std::thread::hardware_concurrency();
+  if (g_nthr <= 0) g_nthr = 2;
+  if (g_nthr > 16) g_nthr = 16;
 
   // --flood N：单项洪灌测量（数据面优化前后受控对比），不触碰 exp_report.md
   if (flood > 0) {
@@ -1105,9 +1196,9 @@ int main(int argc, char** argv) {
   g_report << "- 本报告由 `exp` 程序一次运行自动生成，所有数字均为实测。\n";
 
   std::printf("[1/11] 攻击矩阵...\n");  std::fflush(stdout);
-  exp_attack_matrix(trials);
+  exp_attack_matrix(trials, g_nthr);
   std::printf("[2/11] 多候选矩阵...\n"); std::fflush(stdout);
-  exp_multicand(trials);
+  exp_multicand(trials, g_nthr);
   std::printf("[3/11] 时延 vs k...\n");  std::fflush(stdout);
   {
     std::vector<double> ks, tag, scan;

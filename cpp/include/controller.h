@@ -53,9 +53,11 @@ struct DirStat {
 class Controller {
  public:
   // trace_cap：逐跳取证记录的 nonce 条数上界（内存有界；超出后按世代清空，
-  // 旧取证的包退化为候选对比定位）。
+  // 旧取证的包退化为候选对比定位）。取证行与其包上报行在文件中相邻（同一
+  // 包的几跳取证间隔 ≈ 在途包数），2^14 已有数百倍余量——此前 2^20 配合
+  // string 键最坏可膨胀到数百 MB。
   explicit Controller(uint64_t seed, const std::vector<Direction>& dirs,
-                      size_t trace_cap = 1 << 20);
+                      size_t trace_cap = 1 << 14);
 
   // 处理一行上报；不是已知格式时返回 kind == "" 的事件
   Event feed(const std::string& line);
@@ -85,7 +87,9 @@ class Controller {
   std::vector<ExpectationTable> tables_;
   std::vector<DirStat> stats_;
   std::vector<NonceWindow> windows_;
-  std::unordered_map<std::string, std::vector<HopTrace>> traces_;
+  // 取证表：键 = 方向下标(8b) | nonce(56b)，无字符串分配；单方向条目受
+  // trace_cap 约束（世代清空）
+  std::unordered_map<uint64_t, std::vector<HopTrace>> traces_;
   size_t trace_cap_;
 };
 

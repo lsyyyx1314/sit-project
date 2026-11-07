@@ -290,7 +290,7 @@ static void flow_tests() {
     std::vector<uint64_t> shadow;  // 朴素实现：向量存最近 ≤64 个 nonce
     std::mt19937_64 rng(2026);
     bool agree = true;
-    for (int i = 0; i < 10000 && agree; ++i) {
+    for (int i = 0; i < 100000 && agree; ++i) {
       uint64_t n = rng() % 200;  // 小值域，制造大量重复
       auto it = std::find(shadow.begin(), shadow.end(), n);
       bool expect_new = (it == shadow.end());
@@ -304,7 +304,7 @@ static void flow_tests() {
         if (shadow.size() > 64) shadow.erase(shadow.begin());
       }
     }
-    CHECK(agree, "NonceWindow 与朴素窗口模型 10000 次随机操作一致");
+    CHECK(agree, "NonceWindow 与朴素窗口模型 100000 次随机操作一致（平坦链表桶）");
   }
 }
 

@@ -1,7 +1,6 @@
 #include "mpv2.h"
 
 #include <cstring>
-#include <unordered_set>
 
 #include "blake2b.h"
 
@@ -257,22 +256,38 @@ Verdict ExpectationTable::verify_flow_scan(uint64_t n, uint64_t sum_h,
 }
 
 // ---------------------------------------------------------------- 重放窗口
-// 环形缓冲记录到达顺序 + 哈希集合 O(1) 判重。
-// 语义：容量 W 内的重复判为重放；被淘汰的陈旧 nonce 再次出现按新包处理
-// （窗口语义 —— 窗口必须覆盖最大乱序/缓存深度，见设计报告 §13）。
-// 此前的两个缺陷（M5.11 修复）：
-//   * 线性扫描每包 O(W)，10^5 行/秒时 ~2000 次比较；
-//   * `ring_[idx] != 0` 特例使 nonce == 0 的重放永远无法检出。
+// 平坦存储（M5.15）：环形缓冲（到达顺序，O(1) 淘汰最旧）+ 开链桶索引
+// （O(1) 判重）。节点即 ring 槽位本身（无逐条目 malloc），桶数 ≥ 2×容量
+// （负载 ≤ 0.5）。对比此前的节点式 unordered_set：内存 ~229KB → ~80KB/方向
+//（容量 4096），稳态零分配。
+// 语义不变：容量 W 内重复判重放；淘汰后的陈旧 nonce 再次出现按新包处理。
+// 此前的两个缺陷（M5.11 修复）：O(W) 线性扫描；nonce==0 特例绕过。
 struct NonceWindow::Impl {
-  std::unordered_set<uint64_t> live;
-  std::vector<uint64_t> ring;
-  size_t head = 0;
+  std::vector<uint64_t> ring;   // cap：到达顺序
+  std::vector<int32_t> bucket;  // 2^k：桶头（节点下标），-1 空
+  std::vector<int32_t> next;    // cap：桶内链表 next
+  uint64_t mask = 0;
+  size_t head = 0;              // 下一个写入位置（满时即最旧元素）
 };
+
+// splitmix64 终混（桶索引用；nonce 已是 56bit 高熵值）
+inline uint32_t nwin_hash(uint64_t x, uint64_t mask) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return (uint32_t)(x & mask);
+}
 
 NonceWindow::NonceWindow(size_t capacity)
     : impl_(new Impl), cap_(capacity ? capacity : 1) {
   impl_->ring.assign(cap_, 0);
-  impl_->live.reserve(cap_ * 2);
+  impl_->next.assign(cap_, -1);
+  size_t b = 2;
+  while (b < cap_ * 2) b <<= 1;
+  impl_->bucket.assign(b, -1);
+  impl_->mask = b - 1;
 }
 
 NonceWindow::NonceWindow(NonceWindow&& o) noexcept
@@ -296,15 +311,22 @@ NonceWindow& NonceWindow::operator=(NonceWindow&& o) noexcept {
 NonceWindow::~NonceWindow() { delete impl_; }
 
 bool NonceWindow::see(uint64_t nonce) {
-  if (impl_->live.count(nonce)) return false;  // 窗口内重复：重放
-  if (n_ < cap_) {
-    ++n_;
+  uint32_t b = nwin_hash(nonce, impl_->mask);
+  for (int32_t j = impl_->bucket[b]; j >= 0; j = impl_->next[j])
+    if (impl_->ring[(size_t)j] == nonce) return false;  // 窗口内重复：重放
+  if (n_ == cap_) {
+    // 淘汰最旧（节点下标 = head）：从其所在桶链摘除
+    uint32_t ob = nwin_hash(impl_->ring[impl_->head], impl_->mask);
+    int32_t* link = &impl_->bucket[ob];
+    while (*link >= 0 && (size_t)*link != impl_->head) link = &impl_->next[*link];
+    if (*link >= 0) *link = impl_->next[*link];
   } else {
-    impl_->live.erase(impl_->ring[impl_->head]);  // 淘汰最旧
+    ++n_;
   }
   impl_->ring[impl_->head] = nonce;
+  impl_->next[impl_->head] = impl_->bucket[b];
+  impl_->bucket[b] = (int32_t)impl_->head;
   impl_->head = (impl_->head + 1) % cap_;
-  impl_->live.insert(nonce);
   return true;
 }
 

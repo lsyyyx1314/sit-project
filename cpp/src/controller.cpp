@@ -186,8 +186,11 @@ Event Controller::feed_trace(std::istringstream& ss) {
   if (std::sscanf(ss.str().c_str(), "TRACE %31s %u %u %u %u %llu %u %llu", mac,
                   &sid, &in_p, &out_p, &tag, &nonce, &pos, &v_after) != 8)
     return ev;
-  traces_[std::string(mac) + "|" + std::to_string(nonce)].push_back(
-      HopTrace{sid, in_p, out_p, pos, v_after});
+  int d = dir_of(mac);
+  if (d < 0) return ev;  // 未知方向的取证无从对照，不入表
+  // 键 = 方向(8b) | nonce(56b)：nonce 空间 56 bit，方向数 < 256，无碰撞
+  uint64_t key = ((uint64_t)d << 56) | (uint64_t)nonce;
+  traces_[key].push_back(HopTrace{sid, in_p, out_p, pos, v_after});
   // 内存上界：长期在线时取证按世代清空（旧取证的包退化为候选对比定位）
   if (traces_.size() > trace_cap_) traces_.clear();
   return ev;  // kind == ""，trace 不产生判定事件
@@ -210,8 +213,9 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
   std::vector<int> out;
   if (dir >= dirs_.size()) return out;
   const Path& claimed = dirs_[dir].paths[tag];
-  const std::string key = dirs_[dir].mac + "|" + std::to_string(nonce);
-  auto it = traces_.find(key);
+  // 键 = 方向(8b) | nonce(56b)，与 feed_trace 一致
+  const uint64_t tkey = ((uint64_t)dir << 56) | (uint64_t)nonce;
+  auto it = traces_.find(tkey);
 
   uint64_t hh = h_of(nonce);
   if (it == traces_.end() || it->second.empty()) {
