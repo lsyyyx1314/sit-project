@@ -69,6 +69,8 @@ void cleanup() {
 
 void setup_links() {
   cleanup();
+  // 注：曾试验 net.core.busy_poll/busy_read=50 配合 SO_BUSY_POLL（M5.17），
+  // 实测 CPU 大增而墙钟无益（veth 对端唤醒不受本端忙等影响），已回退。
   for (const char* base : {"h1", "h2"}) must("ip netns add " + nsname(base));
   for (const char* base : {"h1", "h2"})
     sh(std::string("ip netns exec ") + nsname(base) +

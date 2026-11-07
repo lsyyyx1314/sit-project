@@ -32,6 +32,8 @@
 #include <linux/if_packet.h>
 #include <net/if.h>
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -55,6 +57,14 @@ namespace {
 
 constexpr uint16_t kShimEther = 0x88B5;
 constexpr uint16_t kIpEther = 0x0800;
+
+// ---------------------------------------------------------------- 内核加速（M5.17）
+// 1) TPACKET_V3 RX ring：内核把收到的帧直接写进 mmap 共享环，用户态处理完
+//    把块状态置回 KERNEL——彻底消除逐包 recvfrom/recvmmsg 系统调用；
+//    retire_blk_tov=20ms 保证低速率下块也及时归还（tailer 语义不变）。
+// 2) PACKET_QDISC_BYPASS：发包旁路 qdisc 排队，sendto 直达驱动。
+// 3) SO_BUSY_POLL：套接字忙轮询，缩短每跳唤醒延迟（配合 topo 的 sysctl）。
+//    环建立失败时自动回退 recvmmsg 路径（旧路径保留）。
 
 struct Entry {
   int port = 0;
@@ -97,7 +107,36 @@ struct Port {
   std::string name;
   int fd = -1;
   int ifindex = 0;
+  uint8_t mac[6] = {0};  // 本接口 MAC（V3 头无 pkttype，出向帧用它过滤）
+  // TPACKET_V3 RX ring（建立失败时 rx_map == nullptr → recvmmsg 兜底）
+  uint8_t* rx_map = nullptr;
+  size_t rx_map_len = 0;
+  uint32_t rx_block_nr = 0, rx_block_size = 0, rx_frame_size = 0;
 };
+
+bool setup_rx_ring(Port& p) {
+  int ver = TPACKET_V3;
+  if (::setsockopt(p.fd, SOL_PACKET, PACKET_VERSION, &ver, sizeof(ver)) != 0)
+    return false;
+  struct tpacket_req3 req {};
+  req.tp_block_size = 131072;  // 4 块 × 128KB，每块 32 帧 × 4KB
+  req.tp_frame_size = 4096;
+  req.tp_block_nr = 4;
+  req.tp_sizeof_priv = 0;
+  req.tp_retire_blk_tov = 20;  // 低速率下 20ms 也归还块（tailer 语义不变）
+  req.tp_feature_req_word = 0;
+  if (::setsockopt(p.fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) != 0)
+    return false;
+  size_t len = (size_t)req.tp_block_nr * req.tp_block_size;
+  void* m = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, p.fd, 0);
+  if (m == MAP_FAILED) return false;
+  p.rx_map = static_cast<uint8_t*>(m);
+  p.rx_map_len = len;
+  p.rx_block_nr = req.tp_block_nr;
+  p.rx_block_size = req.tp_block_size;
+  p.rx_frame_size = req.tp_frame_size;
+  return true;
+}
 
 // nonce 来源：内核 CSPRNG（getrandom）。
 // 此前用 srand(seed^sid)+rand()：同 seed 每次启动产生完全相同的 nonce 序列，
@@ -117,6 +156,17 @@ uint64_t fresh_nonce() {
 enum class Evil { kNone, kBitflip, kDup };
 
 std::atomic<bool> g_stop{false};  // SIGTERM/SIGINT 置位，run() 主循环退出
+
+// MPV_RX_RING=1 时启用 TPACKET_V3 收包环（默认关——对串行转发链实测净伤害，§19）
+const bool g_qdisc_bypass = [] {
+  const char* e = ::getenv("MPV_QDISC_BYPASS");
+  return e && e[0] == '1';  // veth 为 noqueue：实测 bypass 反增 CPU，默认关（§19）
+}();
+
+const bool g_rx_ring = [] {
+  const char* e = ::getenv("MPV_RX_RING");
+  return e && e[0] == '1';
+}();
 
 class VSwitch {
  public:
@@ -138,6 +188,16 @@ class VSwitch {
     }
     // ρ 的幂只与位置有关：预计算查表，替掉转发热路径上的模幂
     for (int i = 0; i < RHO_POW_N; ++i) rho_[i] = powmod(RHO, (uint64_t)i);
+    // M5.17 内核加速：MPV_RX_RING=1 时为每个端口建立 TPACKET_V3 RX ring
+    //（默认关闭——实测对串行转发链是净伤害，见 §19；失败回退 recvmmsg）
+    if (g_rx_ring) {
+      int rings = 0;
+      for (Port& p : ports_)
+        if (setup_rx_ring(p)) ++rings;
+      if (debug_)
+        std::fprintf(stderr, "[s%u] rx_ring=%d/%zu\n", sid_, rings,
+                     ports_.size());
+    }
     report_ = std::fopen(report_path_.c_str(), "a");
     if (!trace_path.empty()) trace_ = std::fopen(trace_path.c_str(), "a");
     load_table(true);
@@ -230,9 +290,8 @@ class VSwitch {
     return it == entries_.end() ? nullptr : &it->second;
   }
 
-  // recvmmsg 批量收包：一次 syscall 取一批帧，替代每帧一次 recvfrom。
-  // 批次不满即认为暂无更多帧，回到 poll。
-  void drain(const Port& p) {
+  // recvmmsg 兜底（RX ring 建立失败时使用）
+  void drain_fallback(const Port& p) {
     constexpr int kBatch = 32;
     constexpr size_t kFrame = 2048;  // netns mtu 1500，留足余量
     uint8_t bufs[kBatch][kFrame];
@@ -257,6 +316,38 @@ class VSwitch {
         handle(bufs[i], (size_t)msgs[i].msg_len, p.index);
       }
       if (n < kBatch) break;
+    }
+  }
+
+  // TPACKET_V3：消费环内所有 USER 块。syscall 只发生在 poll 唤醒与状态
+  // 置位，逐包收发零系统调用。
+  void drain(const Port& p) {
+    if (!p.rx_map) {
+      drain_fallback(p);
+      return;
+    }
+    uint32_t fper = p.rx_block_size / p.rx_frame_size;
+    for (uint32_t bi = 0; bi < p.rx_block_nr; ++bi) {
+      auto* bdesc = reinterpret_cast<struct tpacket_block_desc*>(
+          p.rx_map + (size_t)bi * p.rx_block_size);
+      if ((bdesc->hdr.bh1.block_status & TP_STATUS_USER) == 0) continue;
+      uint8_t* base =
+          reinterpret_cast<uint8_t*>(bdesc) + bdesc->hdr.bh1.offset_to_first_pkt;
+      for (uint32_t fi = 0; fi < fper; ++fi) {
+        auto* th = reinterpret_cast<struct tpacket3_hdr*>(
+            base + (size_t)fi * p.rx_frame_size);
+        if ((th->tp_status & TP_STATUS_USER) == 0) continue;
+        uint8_t* fp = base + (size_t)fi * p.rx_frame_size + th->tp_mac;
+        // V3 头无 pkttype：源 MAC == 本接口 MAC 的帧是本端口发出的回环帧
+        if (th->tp_snaplen >= 12 &&
+            std::memcmp(fp + 6, p.mac, 6) != 0) {
+          ++in_;
+          handle(fp, (size_t)th->tp_snaplen, p.index);
+        }
+        th->tp_status = TP_STATUS_KERNEL;
+      }
+      // 块内帧全部处理完毕，归还内核
+      bdesc->hdr.bh1.block_status = TP_STATUS_KERNEL;
     }
   }
 
@@ -406,7 +497,7 @@ class VSwitch {
   bool debug_ = false;
 };
 
-int open_port(const std::string& name) {
+int open_port(Port& p) {
   int fd = ::socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
   if (fd < 0) {
     std::perror("socket");
@@ -415,9 +506,9 @@ int open_port(const std::string& name) {
   struct sockaddr_ll sll{};
   sll.sll_family = AF_PACKET;
   sll.sll_protocol = htons(ETH_P_ALL);
-  sll.sll_ifindex = (int)::if_nametoindex(name.c_str());
+  sll.sll_ifindex = (int)::if_nametoindex(p.name.c_str());
   if (sll.sll_ifindex == 0) {
-    std::fprintf(stderr, "找不到接口 %s\n", name.c_str());
+    std::fprintf(stderr, "找不到接口 %s\n", p.name.c_str());
     ::close(fd);
     return -1;
   }
@@ -426,6 +517,24 @@ int open_port(const std::string& name) {
     ::close(fd);
     return -1;
   }
+  p.fd = fd;
+  p.ifindex = (int)sll.sll_ifindex;
+  // 本接口 MAC：V3 头不带 pkttype，环内出向帧以"源 MAC == 本接口 MAC"过滤
+  struct ifreq ifr{};
+  std::memset(&ifr, 0, sizeof(ifr));
+  std::strncpy(ifr.ifr_name, p.name.c_str(), IFNAMSIZ - 1);
+  if (::ioctl(fd, SIOCGIFHWADDR, &ifr) == 0)
+    std::memcpy(p.mac, ifr.ifr_hwaddr.sa_data, 6);
+  // 内核加速（尽力而为，失败不致命）：
+  //   发包旁路 qdisc（默认开——纯 TX 路径旁路，无负效应）；
+  //   TPACKET_V3 RX ring 与 SO_BUSY_POLL 仅在 MPV_RX_RING=1 时启用——
+  //   实测对低时延串行转发链是净伤害（批等待 + 忙等烧 CPU），
+  //   见设计报告 §19 的对照数据；默认走 recvmmsg 批收路径
+  int one = 1;
+  if (g_qdisc_bypass)
+    (void)::setsockopt(fd, SOL_PACKET, PACKET_QDISC_BYPASS, &one, sizeof(one));
+  if (g_rx_ring)
+    (void)::setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &one, sizeof(one));
   return fd;
 }
 
@@ -466,9 +575,7 @@ int main(int argc, char** argv) {
       Port p;
       p.index = std::stoi(spec.substr(0, pos));
       p.name = spec.substr(pos + 1);
-      p.ifindex = (int)::if_nametoindex(p.name.c_str());
-      p.fd = open_port(p.name);
-      if (p.fd < 0) return 1;
+      if (open_port(p) < 0) return 1;
       ports.push_back(p);
     }
   }

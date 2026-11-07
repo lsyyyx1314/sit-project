@@ -982,9 +982,37 @@ void exp_flood(int flood) {
   pids.push_back(spawn_switch(vswitch_exe(), mk(3, {"1:s3p1", "2:s3p2"})));
   pids.push_back(spawn_switch(vswitch_exe(), mk(4, {"1:s4p1", "2:s4p2", "3:s4p3"})));
   ::sleep(1);
+  // 交换机 CPU 成本基线（/proc/<pid>/stat 的 utime+stime，时钟滴答 10ms）
+  auto cpu_of = [](pid_t p) -> long long {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%d/stat", (int)p);
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return -1;
+    char l[1024];
+    if (!std::fgets(l, sizeof l, f)) { std::fclose(f); return -1; }
+    std::fclose(f);
+    // comm 可含空格：从右往左找 ')' 后的第 12/13 个字段（utime/stime）
+    char* close = std::strrchr(l, ')');
+    if (!close) return -1;
+    long long ut = 0, st = 0;
+    if (std::sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lld %lld",
+                    &ut, &st) != 2)
+      return -1;
+    return ut + st;
+  };
+  long long cpu_before = 0;
+  for (pid_t p : pids) {
+    long long c = cpu_of(p);
+    if (c > 0) cpu_before += c;
+  }
   double t0 = now_us();
   run_traffic(flood, "0");
   double el = (now_us() - t0) / 1e6;
+  long long cpu_after = 0;
+  for (pid_t p : pids) {
+    long long c = cpu_of(p);
+    if (c > 0) cpu_after += c;
+  }
   ::sleep(1);
   for (pid_t p : pids) stop_switch(p);
   cleanup();
@@ -994,10 +1022,16 @@ void exp_flood(int flood) {
   while (std::getline(in, l))
     if (l.rfind("FLOW ", 0) != 0 && !l.empty()) ++lines;
   double pps = lines / el;
+  long long cpu_ticks = (cpu_after > cpu_before) ? cpu_after - cpu_before : 0;
+  double cpu_s = cpu_ticks / 100.0;  // 100Hz 滴答
   g_report << "- 上报行 " << lines << "（含回程），耗时 " << el << " s，管道处理速率 ≈ "
            << (int)pps << " 行/秒\n";
-  std::printf("[flood] %d 包，%d 行，%.3f s，%d 行/秒\n", flood, lines, el,
-              (int)pps);
+  g_report << "- 4 台交换机 CPU 合计 " << cpu_s << " s（用户+内核），折合 "
+           << (lines > 0 ? cpu_s * 1e6 / lines : 0) << " µs CPU/行（墙钟与 CPU 之差为"
+              "等待/调度——内核路径主导的佐证，见设计报告 §15/§19）\n";
+  std::printf("[flood] %d 包，%d 行，%.3f s，%d 行/秒，CPU %.2f s（%.1f µs/行）\n",
+              flood, lines, el, (int)pps, cpu_s,
+              lines > 0 ? cpu_s * 1e6 / lines : 0);
 }
 
 // ---------------------------------------------------------------- [7] 端到端
