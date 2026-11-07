@@ -76,7 +76,7 @@ class Controller {
 
  private:
   int dir_of(const std::string& mac) const;
-  Event feed_packet(std::istringstream& ss);
+  Event feed_packet(const std::string& line);  // 热路径：手写解析
   Event feed_flow(std::istringstream& ss);
   Event feed_trace(std::istringstream& ss);
 

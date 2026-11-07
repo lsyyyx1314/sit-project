@@ -448,7 +448,8 @@ static void controller_tests() {
         et = addmod(et, mulmod(contribution(kr, p0[j], hn), powmod(RHO, (uint64_t)j)));
         char tl[160];
         std::snprintf(tl, sizeof(tl), "TRACE %s %u %u %u 0 %llu %zu %llu", MAC,
-                      p0[j].sid, p0[j].in_port, p0[j].out_port, n, j + 1,
+                      p0[j].sid, p0[j].in_port, p0[j].out_port,
+                      (unsigned long long)n, j + 1,
                       (unsigned long long)et);
         c3.feed(tl);
       }

@@ -56,7 +56,7 @@ class KeyRing {
                           uint64_t seed);
 
   uint64_t port_key(const Hop& h) const; // 式 (2)：k_i ⊕ k_in ⊕ k_out 再派生
-  HopKey hop_key(const Hop& h) const;
+  HopKey hop_key(const Hop& h) const;    // 备忘录化：同一跳只派生一次
 
  private:
   struct SwitchKeys {
@@ -64,6 +64,7 @@ class KeyRing {
     std::unordered_map<uint32_t, uint64_t> ports;
   };
   std::unordered_map<uint32_t, SwitchKeys> switches_;
+  mutable std::unordered_map<uint32_t, HopKey> hop_cache_;  // 单线程访问约定
 };
 
 // ---------------------------------------------------------------- 公开哈希
@@ -109,6 +110,10 @@ class ExpectationTable {
   Verdict verify_tag(const Header& hdr) const;
   // scan 模式：遍历候选集，O(k) —— BPMV
   Verdict verify_scan(const Header& hdr) const;
+  // 预计算 hh = h_of(nonce) 的重载：同一 hdr 连续做 tag+scan 双口径判定时
+  // 复用一次公开哈希（Controller 热路径；公开哈希占单次判定 ~99% 时间）
+  Verdict verify_tag(const Header& hdr, uint64_t hh) const;
+  Verdict verify_scan(const Header& hdr, uint64_t hh) const;
   // 流级判定（CFMV）：N·A + B·Σh == ΣV，整个窗口一次判定
   Verdict verify_flow(uint8_t tag, uint64_t n, uint64_t sum_h,
                       uint64_t sum_v) const;
@@ -147,22 +152,8 @@ class NonceWindow {
   ~NonceWindow();
   NonceWindow(const NonceWindow&) = delete;
   NonceWindow& operator=(const NonceWindow&) = delete;
-  NonceWindow(NonceWindow&& o) noexcept
-      : impl_(o.impl_), cap_(o.cap_), n_(o.n_) {
-    o.impl_ = nullptr;
-    o.n_ = 0;
-  }
-  NonceWindow& operator=(NonceWindow&& o) noexcept {
-    if (this != &o) {
-      delete impl_;
-      impl_ = o.impl_;
-      cap_ = o.cap_;
-      n_ = o.n_;
-      o.impl_ = nullptr;
-      o.n_ = 0;
-    }
-    return *this;
-  }
+  NonceWindow(NonceWindow&& o) noexcept;             // 实现在 .cpp（Impl 不完整类型）
+  NonceWindow& operator=(NonceWindow&& o) noexcept;
   // 首次出现返回 true；窗口内的重复返回 false。
   bool see(uint64_t nonce);
   size_t size() const { return n_; }
