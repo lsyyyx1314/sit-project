@@ -35,6 +35,7 @@
 
 #include "blake2b.h"
 #include "controller.h"
+#include "tpool.h"
 #include "mpv2.h"
 #include "topo.h"
 
@@ -45,6 +46,7 @@ namespace {
 
 std::ofstream g_report;
 int g_nthr = 2;  // 并行线程数（--threads；默认取 CPU 核数）
+mpv::ThreadPool* g_pool = nullptr;  // 全节复用的线程池（M5.16）
 std::string g_chart_dir = "results/charts";
 
 std::string exe_dir() {
@@ -226,14 +228,13 @@ int exp_attack_matrix(int trials, int nthr) {
   double single_el = now_us() - ts0;
 
   std::vector<MatrixStat> stats(nthr);
-  std::vector<std::thread> ths;
   int per = (trials + nthr - 1) / nthr;
   double t0 = now_us();
   for (int t = 0; t < nthr; ++t) {
     int n = (t == nthr - 1) ? trials - per * (nthr - 1) : per;
-    ths.emplace_back([t, n, &stats] { matrix_worker(t, n, stats[t]); });
+    g_pool->submit([t, n, &stats] { matrix_worker(t, n, stats[t]); });
   }
-  for (auto& th : ths) th.join();
+  g_pool->wait_idle();
   double par_el = now_us() - t0;
 
   MatrixStat st;
@@ -308,13 +309,12 @@ void exp_multicand(int trials, int nthr) {
   g_report << "| k | 诚实接受 | 篡改检出 |\n|---|---|---|\n";
   for (uint32_t k : {2u, 8u, 16u}) {
     std::vector<CandStat> stats(nthr);
-    std::vector<std::thread> ths;
     int per = (trials + nthr - 1) / nthr;
     for (int t = 0; t < nthr; ++t) {
       int n = (t == nthr - 1) ? trials - per * (nthr - 1) : per;
-      ths.emplace_back([t, n, k, &stats] { cand_worker(t, n, k, stats[t]); });
+      g_pool->submit([t, n, k, &stats] { cand_worker(t, n, k, stats[t]); });
     }
-    for (auto& th : ths) th.join();
+    g_pool->wait_idle();
     CandStat st;
     for (const CandStat& s : stats) {
       st.ho += s.ho; st.ho_t += s.ho_t; st.de += s.de; st.de_t += s.de_t;
@@ -526,6 +526,14 @@ void exp_storage() {
             ticks, fs, ss, c2.back().second * 1.15);
   g_report << "- 数据面转发路径：逐跳更新 V 无逐流状态（0 B/跳）；全系统逐流状态只出现在"
               "出口聚合（24B/流）与 nonce 窗口（定长）。\n";
+  // 进程级实测（参考口径）：exp 进程跑完 [1]-[7] 后的峰值/当前内存
+  if (std::FILE* f = std::fopen("/proc/self/status", "r")) {
+    char l[256];
+    while (std::fgets(l, sizeof l, f))
+      if (std::strncmp(l, "VmHWM", 5) == 0 || std::strncmp(l, "VmRSS", 5) == 0)
+        g_report << "- exp 进程实测 " << l;  // 行自带换行
+    std::fclose(f);
+  }
 }
 
 // ---------------------------------------------------------------- [9] 定位成功率
@@ -832,13 +840,12 @@ void exp_baseline(int trials) {
   const double rhos[6] = {0.01, 0.05, 0.1, 0.25, 0.5, 1.0};
   std::vector<uint64_t> v_cnt(6, 0), d_cnt(6, 0);
   {
-    std::vector<std::thread> ths;
     int per = (6 + g_nthr - 1) / g_nthr;
     for (int t = 0; t < g_nthr; ++t) {
       int lo = t * per, hi = lo + per;
       if (hi > 6) hi = 6;
       if (lo >= hi) break;
-      ths.emplace_back([lo, hi, &pkts, &tb, &rhos, &v_cnt, &d_cnt] {
+      g_pool->submit([lo, hi, &pkts, &tb, &rhos, &v_cnt, &d_cnt] {
         for (int ri = lo; ri < hi; ++ri) {
           uint64_t det = 0, verified = 0;
           for (const Pkt& pk : pkts) {
@@ -852,7 +859,7 @@ void exp_baseline(int trials) {
         }
       });
     }
-    for (auto& th : ths) th.join();
+    g_pool->wait_idle();
   }
   std::vector<std::pair<double, double>> sample_pts;
   for (int ri = 0; ri < 6; ++ri) {
@@ -1171,6 +1178,8 @@ int main(int argc, char** argv) {
   g_nthr = nthr > 0 ? nthr : (int)std::thread::hardware_concurrency();
   if (g_nthr <= 0) g_nthr = 2;
   if (g_nthr > 16) g_nthr = 16;
+  mpv::ThreadPool pool((size_t)g_nthr);  // 全实验复用（M5.16）
+  g_pool = &pool;
 
   // --flood N：单项洪灌测量（数据面优化前后受控对比），不触碰 exp_report.md
   if (flood > 0) {

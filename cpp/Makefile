@@ -3,9 +3,9 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
 
 BUILD := build
-SRC_CORE := src/blake2b.cpp src/mpv2.cpp
+SRC_CORE := src/blake2b.cpp src/mpv2.cpp src/tpool.cpp
 SRC_NET  := src/controller.cpp src/topo.cpp
-HDRS := include/blake2b.h include/mpv2.h include/controller.h include/topo.h
+HDRS := include/blake2b.h include/mpv2.h include/controller.h include/topo.h include/tpool.h
 BINS := tests vswitch verify_reports bench e2e dashboard exp
 
 .PHONY: all test bench e2e demo clean

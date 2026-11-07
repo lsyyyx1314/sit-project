@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "controller.h"
+#include "tpool.h"
 #include "topo.h"
 
 using namespace mpv;
@@ -45,12 +46,11 @@ namespace {
 // ---------------------------------------------------------------- 状态
 struct EventView {
   double t;
-  std::string mac;
-  std::string nonce_hex;
+  uint8_t dir;     // 方向下标（0 = h1→h2）——取代 mac 字符串
+  uint64_t nonce;  // JSON 序列化时再格式化——取代预格式化的字符串字段
   int tag, matched, suspect;
   std::vector<int> suspects;
-  bool ok, replay, lost;
-  std::string kind;  // packet | flow
+  bool ok, replay, lost, is_flow;  // 取代 kind 字符串
   uint64_t n;
   double us;
 };
@@ -219,10 +219,8 @@ void handle_line(const std::string& line) {
 
   EventView v;
   v.t = mono_s() - g_started;
-  v.mac = ev.mac;
-  char nh[20];
-  std::snprintf(nh, sizeof(nh), "0x%014llx", (unsigned long long)ev.nonce);
-  v.nonce_hex = nh;
+  v.dir = (uint8_t)d;
+  v.nonce = ev.nonce;
   v.tag = (int)ev.tag;
   v.ok = ev.ok;
   v.replay = ev.replay;
@@ -230,7 +228,7 @@ void handle_line(const std::string& line) {
   v.suspect = ev.suspect_sid;
   v.suspects = ev.suspects;
   v.lost = false;
-  v.kind = ev.kind;
+  v.is_flow = (ev.kind == "flow");
   v.n = ev.n;
   v.us = ev.verify_us;
   g_state.us_sum[(size_t)d] += ev.verify_us;
@@ -316,17 +314,15 @@ void blackhole_check() {
     if (s >= 0) g_state.lost_suspects.push_back(s);
     EventView v;
     v.t = mono_s() - g_started;
-    v.mac = H2MAC;
-    char nh[20];
-    std::snprintf(nh, sizeof(nh), "0x%014llx", (unsigned long long)n);
-    v.nonce_hex = nh;
+    v.dir = 0;
+    v.nonce = n;
     v.tag = 0;
     v.ok = false;
     v.replay = false;
     v.matched = -1;
     v.suspect = s;
     v.lost = true;
-    v.kind = "packet";
+    v.is_flow = false;
     v.n = 0;
     v.us = 0;
     push_event(v);
@@ -456,13 +452,24 @@ std::string json_state() {
       << ",\"cpmv\":" << s.cpmv_checks << ",\"bpmv\":" << s.bpmv_checks
       << ",\"cfmv\":" << s.cfmv_checks << ",\"avg_us\":" << avg << "}";
   }
-  o << "],\"events\":[";
+  o << ",\"rss_kb\":" << [&] {
+    unsigned long long rss_kb = 0;
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+      long long tot = 0, res = 0;
+      if (std::fscanf(f, "%lld %lld", &tot, &res) == 2) rss_kb = (unsigned long long)res * 4;
+      std::fclose(f);
+    }
+    return rss_kb;
+  }();
+  o << ",\"events\":[";
   size_t from = g_state.events.size() > 40 ? g_state.events.size() - 40 : 0;
   for (size_t i = from; i < g_state.events.size(); ++i) {
     const EventView& e = g_state.events[i];
     if (i > from) o << ",";
-    o << "{\"t\":" << e.t << ",\"mac\":\"" << esc(e.mac) << "\""
-      << ",\"nonce\":\"" << esc(e.nonce_hex) << "\",\"tag\":" << e.tag
+    char nh[20];
+    std::snprintf(nh, sizeof(nh), "0x%014llx", (unsigned long long)e.nonce);
+    o << "{\"t\":" << e.t << ",\"mac\":\"" << esc(g_ctl->directions()[e.dir].mac) << "\""
+      << ",\"nonce\":\"" << nh << "\",\"tag\":" << e.tag
       << ",\"ok\":" << (e.ok ? "true" : "false")
       << ",\"replay\":" << (e.replay ? "true" : "false")
       << ",\"lost\":" << (e.lost ? "true" : "false")
@@ -473,7 +480,7 @@ std::string json_state() {
       o << e.suspects[k];
     }
     o << "]"
-      << ",\"us\":" << e.us << ",\"kind\":\"" << esc(e.kind) << "\""
+      << ",\"us\":" << e.us << ",\"is_flow\":" << (e.is_flow ? "true" : "false")
       << ",\"n\":" << e.n << "}";
   }
   o << "]}";
@@ -624,6 +631,7 @@ td{padding:4px 6px;border-bottom:1px solid #1a2440;font-family:Consolas,monospac
       <div class="card"><div class="v" id="vflows">0/0</div><div class="k">流级窗口 通过/总</div></div>
       <div class="card"><div class="v" id="vlat">–</div><div class="k">平均判定耗时 µs</div></div>
       <div class="card"><div class="v" id="vuptime">0</div><div class="k">运行秒数</div></div>
+      <div class="card"><div class="v" id="vrss">–</div><div class="k">内存 RSS</div></div>
     </div>
     <button class="btn" id="send20">▶ 发送 20 包</button>
     <button class="btn" id="send100">▶▶ 发送 100 包</button>
@@ -705,6 +713,7 @@ async function refresh(){
  const us_cnt=f.avg_us&&rv.avg_us?(f.avg_us+rv.avg_us)/2:(f.avg_us||rv.avg_us||0);
  document.getElementById("vlat").textContent=us_cnt?us_cnt.toFixed(2):"–";
  document.getElementById("vuptime").textContent=j.uptime.toFixed(0);
+ document.getElementById("vrss").textContent=(j.rss_kb/1024).toFixed(1)+"M";
  // 柱状图
  const bars=document.getElementById("bars");bars.innerHTML="";
  const mx=Math.max(bp,cp,cf,1);
@@ -714,24 +723,24 @@ async function refresh(){
   d.innerHTML='<div class="vv">'+fmt(v)+'</div><div class="lb">'+l+'</div>';bars.appendChild(d)});
  // 事件
  const tb=document.getElementById("evt");tb.innerHTML="";
- const mac2d=m=>m==="00:00:00:00:00:02"?"h1→h2":"h2→h1";
+ const mac2d=d=>d===0?"h1→h2":"h2→h1";
  for(let i=Math.max(0,j.events.length-12);i<j.events.length;i++){const e=j.events[i];
   const tr=document.createElement("tr");
   let verdict=e.lost?'<span class="rp">失联</span>':e.replay?'<span class="rp">重放</span>':(e.ok?'<span class="ok">通过</span>':'<span class="bad">失败</span>');
-  if(e.kind==="flow")verdict=(e.ok?'<span class="ok">流级通过</span>':'<span class="bad">流级失败</span>')+" N="+e.n;
+  if(e.is_flow)verdict=(e.ok?'<span class="ok">流级通过</span>':'<span class="bad">流级失败</span>')+" N="+e.n;
   const loc=(e.suspects&&e.suspects.length)?'<span class="bad">s'+e.suspects.join(', s')+'</span>':"–";
-  tr.innerHTML="<td>"+e.t.toFixed(1)+"</td><td>"+(e.kind==="flow"?"流级·":"")+mac2d(e.mac)+"</td><td>"+e.nonce+"</td><td>"+e.tag+"</td><td>"+verdict+"</td><td>"+loc+"</td><td>"+e.us.toFixed(2)+"µs</td>";
+  tr.innerHTML="<td>"+e.t.toFixed(1)+"</td><td>"+(e.is_flow?"流级·":"")+mac2d(e.dir)+"</td><td>"+e.nonce+"</td><td>"+e.tag+"</td><td>"+verdict+"</td><td>"+loc+"</td><td>"+e.us.toFixed(2)+"µs</td>";
   tb.appendChild(tr)}
  // 流级窗口表
  const ft=document.getElementById("flowevt");ft.innerHTML="";
  for(let i=j.events.length-1;i>=0&&ft.children.length<6;i--){const e=j.events[i];
-  if(e.kind!=="flow")continue;const tr=document.createElement("tr");
+  if(!e.is_flow)continue;const tr=document.createElement("tr");
   tr.innerHTML="<td>"+e.t.toFixed(1)+"</td><td>"+mac2d(e.mac)+"</td><td>"+e.tag+"</td><td>"+e.n+"</td><td>"+(e.ok?'<span class="ok">通过</span>':'<span class="bad">失败</span>')+"</td><td>"+e.us.toFixed(2)+"µs</td>";
   ft.appendChild(tr)}
  // 拓扑动画：新事件
  for(let i=S.last;i<j.events.length;i++){const e=j.events[i];
-  if(e.kind!=="packet")continue;
-  const fwd=e.mac==="00:00:00:00:00:02";
+  if(e.is_flow)continue;
+  const fwd=e.dir===0;
   const pi=(S.scen==="failover")?(fwd?"fwd1":"rev1"):(e.lost?"fwd1":(e.matched>=0&&e.matched<=1?(fwd?(e.matched?"fwd1":"fwd0"):(e.matched?"rev1":"rev0")):(fwd?"fwd0":"rev0")));
   const col=e.lost?"#fbbf24":e.replay?"#fbbf24":e.ok?"#4ade80":"#f87171";
   dot(PATHS[pi],col,e.lost?"s3":undefined)}
@@ -868,8 +877,10 @@ int main(int argc, char** argv) {
               port);
   std::fflush(stdout);
 
-  // 并发连接上限：超出直接 503，防止线程被慢连接拖垮
+  // 并发连接上限 + 线程池（M5.16）：服务线程固定预起、栈收紧 512KB，
+  // 超出直接 503——此前每连接临时起 8MB 栈的线程
   constexpr int kMaxConns = 32;
+  mpv::ThreadPool conn_pool(kMaxConns);
   std::atomic<int> g_conns{0};
   const char* k503 =
       "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n"
@@ -893,10 +904,10 @@ int main(int argc, char** argv) {
       continue;
     }
     ++g_conns;
-    std::thread([fd, &g_conns] {
+    conn_pool.submit([fd, &g_conns] {
       serve(fd);
       --g_conns;
-    }).detach();
+    });
   }
 
   // 主线程收尾：停交换机 → 清拓扑 → 释放控制器

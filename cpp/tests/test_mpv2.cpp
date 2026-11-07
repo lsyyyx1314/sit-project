@@ -7,6 +7,7 @@
 //
 // 运行： ./build/tests ../results/golden_vectors.txt
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@
 
 #include "mpv2.h"
 #include "controller.h"
+#include "tpool.h"
 
 using namespace mpv;
 
@@ -461,6 +463,28 @@ static void controller_tests() {
                   MAC);
     Event evc = c3.feed(line);
     CHECK(!evc.ok, "取证上界溢出后判定功能正常");
+  }
+
+  // 线程池（M5.16）：任务全完成、复用、空等待、栈收紧构造
+  {
+    mpv::ThreadPool pool(4, 256);
+    CHECK_EQ(pool.threads(), 4, "池线程数正确");
+    std::atomic<int> cnt{0};
+    for (int i = 0; i < 1000; ++i) pool.submit([&cnt] { ++cnt; });
+    pool.wait_idle();
+    CHECK(cnt.load() == 1000, "线程池 1000 任务全部完成");
+    for (int i = 0; i < 500; ++i) pool.submit([&cnt] { ++cnt; });
+    pool.wait_idle();
+    CHECK(cnt.load() == 1500, "线程池复用后任务继续完成");
+    // 混合任务：部分任务再提交任务（wait_idle 语义不死角）
+    std::atomic<int> nested{0};
+    for (int i = 0; i < 50; ++i)
+      pool.submit([&pool, &nested] {
+        for (int j = 0; j < 10; ++j) pool.submit([&nested] { ++nested; });
+      });
+    pool.wait_idle();
+    pool.wait_idle();
+    CHECK(nested.load() == 500, "嵌套提交的任务 500 个全部完成");
   }
 }
 
