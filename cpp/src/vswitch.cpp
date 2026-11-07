@@ -63,11 +63,33 @@ struct Entry {
   int in_port = 0;
 };
 
-std::string mac_to_str(const uint8_t* m) {
-  char buf[18];
-  std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1],
-                m[2], m[3], m[4], m[5]);
-  return buf;
+// MAC 全部以 48-bit 整数参与查表与流聚合键——每包路径上零堆分配。
+// （此前 dst/src 每包构造 std::string、查表键再拼两次 string，是热路径
+//  最大的非 syscall 开销；src 甚至从未被使用。）
+uint64_t mac_key(const uint8_t* m) {
+  uint64_t v = 0;
+  for (int i = 0; i < 6; ++i) v = (v << 8) | m[i];
+  return v;
+}
+
+bool mac_from_str(const char* s, uint64_t& out) {
+  unsigned b[6];
+  if (std::sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3],
+                  &b[4], &b[5]) != 6)
+    return false;
+  out = 0;
+  for (int i = 0; i < 6; ++i) out = (out << 8) | (b[i] & 0xff);
+  return true;
+}
+
+// 查表/流聚合键 = mac48 << 8 | tag（tag 8 bit）
+uint64_t entry_key(uint64_t mac48, uint8_t tag) { return (mac48 << 8) | tag; }
+
+void mac_str(uint64_t m, char* buf /*≥18*/) {
+  std::snprintf(buf, 18, "%02x:%02x:%02x:%02x:%02x:%02x",
+                (unsigned)((m >> 40) & 0xff), (unsigned)((m >> 32) & 0xff),
+                (unsigned)((m >> 24) & 0xff), (unsigned)((m >> 16) & 0xff),
+                (unsigned)((m >> 8) & 0xff), (unsigned)(m & 0xff));
 }
 
 struct Port {
@@ -75,13 +97,6 @@ struct Port {
   std::string name;
   int fd = -1;
   int ifindex = 0;
-};
-
-struct PairHash {
-  size_t operator()(const std::pair<std::string, std::string>& p) const {
-    return std::hash<std::string>()(p.first) ^
-           (std::hash<std::string>()(p.second) << 1);
-  }
 };
 
 // nonce 来源：内核 CSPRNG（getrandom）。
@@ -121,9 +136,19 @@ class VSwitch {
       fd_by_port_[p.index] = p.fd;
       ifindex_by_port_[p.index] = p.ifindex;
     }
+    // ρ 的幂只与位置有关：预计算查表，替掉转发热路径上的模幂
+    for (int i = 0; i < RHO_POW_N; ++i) rho_[i] = powmod(RHO, (uint64_t)i);
     report_ = std::fopen(report_path_.c_str(), "a");
     if (!trace_path.empty()) trace_ = std::fopen(trace_path.c_str(), "a");
     load_table(true);
+  }
+
+  static constexpr int RHO_POW_N = 80;
+
+  uint64_t rho_pow(uint32_t pos_1based) const {
+    return pos_1based >= 1 && pos_1based <= (uint32_t)RHO_POW_N
+               ? rho_[pos_1based - 1]
+               : powmod(RHO, pos_1based - 1);
   }
 
   void stats() const {
@@ -139,8 +164,10 @@ class VSwitch {
     for (auto& kv : flows_) {
       FlowAgg& a = kv.second;
       if (a.n == 0) continue;
-      std::fprintf(report_, "FLOW %s %s %llu %llu %llu\n", kv.first.first.c_str(),
-                   kv.first.second.c_str(), (unsigned long long)a.n,
+      char db[18];
+      mac_str(kv.first >> 8, db);
+      std::fprintf(report_, "FLOW %s %u %llu %llu %llu\n", db,
+                   (unsigned)(kv.first & 0xff), (unsigned long long)a.n,
                    (unsigned long long)a.sum_h, (unsigned long long)a.sum_v);
       a.reset();
     }
@@ -160,6 +187,14 @@ class VSwitch {
           if (!(pfds[i].revents & POLLIN)) continue;
           drain(ports_[i]);
         }
+      }
+      // 每个轮次末统一冲刷上报/取证文件：每包 fflush 是热路径上最密集的
+      // syscall（每包 1~2 次），批量冲刷把 N 次收成 1 次，且帧到达至可见
+      // 的延迟不超过一个 poll 轮次（tailer 轮询 120ms，语义不变）
+      if (dirty_) {
+        if (report_) std::fflush(report_);
+        if (trace_) std::fflush(trace_);
+        dirty_ = false;
       }
       if (++last_check % 2 == 0) load_table(false);  // 约每 400ms 检查一次
     }
@@ -182,40 +217,53 @@ class VSwitch {
       if (std::sscanf(line, "%31s %d %d %d %d %d", mac, &tag, &port, &pos, &strip,
                       &in_port) != 6)
         continue;
-      entries_[std::string(mac) + "|" + std::to_string(tag)] =
-          Entry{port, pos, strip != 0, in_port};
+      uint64_t mk;
+      if (!mac_from_str(mac, mk)) continue;
+      if (tag < 0 || tag > 255) continue;
+      entries_[entry_key(mk, (uint8_t)tag)] = Entry{port, pos, strip != 0, in_port};
     }
     std::fclose(f);
   }
 
-  const Entry* lookup(const std::string& mac, int tag) const {
-    auto it = entries_.find(mac + "|" + std::to_string(tag));
+  const Entry* lookup(uint64_t mac48, uint8_t tag) const {
+    auto it = entries_.find(entry_key(mac48, tag));
     return it == entries_.end() ? nullptr : &it->second;
   }
 
+  // recvmmsg 批量收包：一次 syscall 取一批帧，替代每帧一次 recvfrom。
+  // 批次不满即认为暂无更多帧，回到 poll。
   void drain(const Port& p) {
-    uint8_t buf[65536];
+    constexpr int kBatch = 32;
+    constexpr size_t kFrame = 2048;  // netns mtu 1500，留足余量
+    uint8_t bufs[kBatch][kFrame];
+    struct mmsghdr msgs[kBatch];
+    struct iovec iovecs[kBatch];
+    struct sockaddr_ll addrs[kBatch];
     while (true) {
-      struct sockaddr_ll sll{};
-      socklen_t sl = sizeof(sll);
-      ssize_t n = ::recvfrom(p.fd, buf, sizeof(buf), MSG_DONTWAIT,
-                             reinterpret_cast<sockaddr*>(&sll), &sl);
-      if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        break;
+      std::memset(msgs, 0, sizeof(msgs));
+      for (int i = 0; i < kBatch; ++i) {
+        iovecs[i].iov_base = bufs[i];
+        iovecs[i].iov_len = kFrame;
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &addrs[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
       }
-      if (n == 0) break;  // 接口被删除等异常：0 帧不是合法以太帧，避免空转
-      if (sll.sll_pkttype == PACKET_OUTGOING) continue;  // 过滤本端口发出的帧
-      ++in_;
-      handle(buf, static_cast<size_t>(n), p.index);
+      int n = ::recvmmsg(p.fd, msgs, kBatch, MSG_DONTWAIT, nullptr);
+      if (n <= 0) break;  // EAGAIN / 异常：回到 poll
+      for (int i = 0; i < n; ++i) {
+        if (addrs[i].sll_pkttype == PACKET_OUTGOING) continue;  // 本端口发出的帧
+        ++in_;
+        handle(bufs[i], (size_t)msgs[i].msg_len, p.index);
+      }
+      if (n < kBatch) break;
     }
   }
 
   void handle(const uint8_t* frame, size_t len, int in_idx) {
     if (len < 14) return;
     uint16_t ether = (uint16_t)((frame[12] << 8) | frame[13]);
-    std::string dst = mac_to_str(frame);
-    std::string src = mac_to_str(frame + 6);
+    uint64_t dk = mac_key(frame);  // 目的 MAC（48-bit 键，全程无堆分配）
 
     uint8_t tag = 0;
     uint64_t nonce = 0, acc = 0;
@@ -251,7 +299,7 @@ class VSwitch {
         tag = (uint8_t)(mix % (uint64_t)(paths_ > 0 ? paths_ : 1));
       }
     }
-    e = lookup(dst, tag);
+    e = lookup(dk, tag);
     if (!e) {
       ++drop_;
       return;
@@ -268,7 +316,7 @@ class VSwitch {
       acc = h.acc;
     } else {
       uint64_t c = contribution(kr_, hop, h_of(nonce));
-      acc = addmod(acc, mulmod(c, powmod(RHO, (uint64_t)e->pos - 1)));
+      acc = addmod(acc, mulmod(c, rho_pow(e->pos)));
     }
 
     // 恶意交换机：篡改验证头（在本跳的合法贡献之后叠加比特翻转）
@@ -307,31 +355,33 @@ class VSwitch {
       ::sendto(out_fd, out, off + payload_len, 0,
                reinterpret_cast<sockaddr*>(&dst_addr), sizeof(dst_addr));
 
-    // 逐跳取证：记录本跳之后实际写进帧里的累加值
+    // 逐跳取证：记录本跳之后实际写进帧里的累加值（flush 由 run() 轮次末统一做）
     if (trace_) {
-      std::fprintf(trace_, "TRACE %s %u %u %u %u %llu %u %llu\n", dst.c_str(),
+      char db[18];
+      mac_str(dk, db);
+      std::fprintf(trace_, "TRACE %s %u %u %u %u %llu %u %llu\n", db,
                    sid_, hop.in_port, e->port, tag,
                    (unsigned long long)nonce, e->pos,
                    (unsigned long long)acc);
-      std::fflush(trace_);
+      dirty_ = true;
     }
 
     if (e->strip) {
+      char db[18];
+      mac_str(dk, db);
       std::fprintf(report_, "%u %u %llu %llu %s\n", sid_, tag,
-                   (unsigned long long)nonce, (unsigned long long)acc,
-                   dst.c_str());
-      std::fflush(report_);
+                   (unsigned long long)nonce, (unsigned long long)acc, db);
+      dirty_ = true;
       // CFMV：按 (流, tag) 聚合，凑满一个窗口上报一行
-      FlowAgg& a = flows_[{dst, std::to_string(tag)}];
+      FlowAgg& a = flows_[entry_key(dk, tag)];
       a.add(nonce, acc);
       if (a.n >= flow_window_) {
-        std::fprintf(report_, "FLOW %s %u %llu %llu %llu\n", dst.c_str(), tag,
+        std::fprintf(report_, "FLOW %s %u %llu %llu %llu\n", db, tag,
                      (unsigned long long)a.n, (unsigned long long)a.sum_h,
                      (unsigned long long)a.sum_v);
         a.reset();
       }
     }
-    (void)src;
   }
 
   KeyRing kr_;
@@ -343,14 +393,15 @@ class VSwitch {
   int force_tag_;
   Evil evil_ = Evil::kNone;
   uint32_t flow_window_ = 32;
-  std::unordered_map<std::pair<std::string, std::string>, FlowAgg, PairHash>
-      flows_;
-  std::unordered_map<std::string, Entry> entries_;
+  std::unordered_map<uint64_t, FlowAgg> flows_;
+  std::unordered_map<uint64_t, Entry> entries_;
   std::unordered_map<int, int> fd_by_port_;
   std::unordered_map<int, int> ifindex_by_port_;
+  uint64_t rho_[RHO_POW_N];
   time_t mtime_ = 0;
   std::FILE* report_ = nullptr;
   std::FILE* trace_ = nullptr;
+  bool dirty_ = false;  // 本轮次有未冲刷的输出（run() 轮次末统一 fflush）
   uint64_t in_ = 0, out_ = 0, drop_ = 0;
   bool debug_ = false;
 };

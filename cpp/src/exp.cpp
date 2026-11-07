@@ -865,6 +865,47 @@ void exp_hops() {
               "期望预计算随 h 线性——一次性成本。\n";
 }
 
+// ---------------------------------------------------------------- 洪灌吞吐
+// 单独测量模式（--flood N）：只跑数据面管道吞吐，写 results/flood_report.md，
+// 用于数据面优化前后的受控对比（同机同参数多次取中位）。
+void exp_flood(int flood) {
+  g_report << "# MPV-2 数据面管道吞吐（单项测量）\n\n";
+  g_report << "- 环境：Ubuntu 24.04，g++ 13，VMware 虚拟机；用户态 AF_PACKET 交换机 4 台\n";
+  g_report << "- 方法：h1 → h2 ping 洪灌 " << flood << " 包，统计逐跳上报行数与耗时\n\n";
+  clear_logs();
+  write_tables(Scenario::kNormal);
+  setup_links();
+  auto mk = [&](int sid, std::vector<std::string> ports) {
+    SwitchConf c;
+    c.sid = sid;
+    c.ports = ports;
+    c.flow_window = 64;
+    return c;
+  };
+  std::vector<pid_t> pids;
+  pids.push_back(spawn_switch(vswitch_exe(), mk(1, {"1:s1p1", "2:s1p2", "3:s1p3"})));
+  pids.push_back(spawn_switch(vswitch_exe(), mk(2, {"1:s2p1", "2:s2p2"})));
+  pids.push_back(spawn_switch(vswitch_exe(), mk(3, {"1:s3p1", "2:s3p2"})));
+  pids.push_back(spawn_switch(vswitch_exe(), mk(4, {"1:s4p1", "2:s4p2", "3:s4p3"})));
+  ::sleep(1);
+  double t0 = now_us();
+  run_traffic(flood, "0");
+  double el = (now_us() - t0) / 1e6;
+  ::sleep(1);
+  for (pid_t p : pids) stop_switch(p);
+  cleanup();
+  int lines = 0;
+  std::ifstream in(report_path());
+  std::string l;
+  while (std::getline(in, l))
+    if (l.rfind("FLOW ", 0) != 0 && !l.empty()) ++lines;
+  double pps = lines / el;
+  g_report << "- 上报行 " << lines << "（含回程），耗时 " << el << " s，管道处理速率 ≈ "
+           << (int)pps << " 行/秒\n";
+  std::printf("[flood] %d 包，%d 行，%.3f s，%d 行/秒\n", flood, lines, el,
+              (int)pps);
+}
+
 // ---------------------------------------------------------------- [7] 端到端
 struct RoundStat {
   int rounds = 0, detect_ok = 0, locate_ok = 0, false_pos = 0;
@@ -1007,40 +1048,7 @@ void exp_e2e(int rounds, int pings) {
     g_report << "| 路径偏离(黑洞) | " << rs.rounds << " | " << rs.detect_ok << " | "
              << rs.locate_ok << " | " << rs.false_pos << " |\n";
   }
-  // 吞吐：ping 洪灌管道
-  g_report << "\n### 数据面管道吞吐（ping 洪灌）\n\n";
-  clear_logs();
-  write_tables(Scenario::kNormal);
-  setup_links();
-  auto mk = [&](int sid, std::vector<std::string> ports) {
-    SwitchConf c;
-    c.sid = sid;
-    c.ports = ports;
-    c.flow_window = 64;
-    return c;
-  };
-  std::vector<pid_t> pids;
-  pids.push_back(spawn_switch(vswitch_exe(), mk(1, {"1:s1p1", "2:s1p2", "3:s1p3"})));
-  pids.push_back(spawn_switch(vswitch_exe(), mk(2, {"1:s2p1", "2:s2p2"})));
-  pids.push_back(spawn_switch(vswitch_exe(), mk(3, {"1:s3p1", "2:s3p2"})));
-  pids.push_back(spawn_switch(vswitch_exe(), mk(4, {"1:s4p1", "2:s4p2", "3:s4p3"})));
-  ::sleep(1);
-  const int FLOOD = 10000;
-  double t0 = now_us();
-  run_traffic(FLOOD, "0");
-  double el = (now_us() - t0) / 1e6;
-  ::sleep(1);
-  for (pid_t p : pids) stop_switch(p);
-  cleanup();
-  // 统计逐包上报行数（不含 FLOW 行）
-  int lines = 0;
-  std::ifstream in(report_path());
-  std::string l;
-  while (std::getline(in, l))
-    if (l.rfind("FLOW ", 0) != 0 && !l.empty()) ++lines;
-  double pps = lines / el;
-  g_report << "- 发送 " << FLOOD << " 个探测包（含回程共 " << lines << " 次逐跳上报出管道），"
-           << "耗时 " << el << " s，管道处理速率 ≈ " << (int)pps << " 包/秒\n";
+  exp_flood(10000);
   g_report << "- 说明：用户态 AF_PACKET 交换机每包多次进出内核，吞吐比硬件低 2~3 个"
               "数量级；本数据用于衡量功能管道与控制器解耦后的承载能力。"
               "控制器侧上报处理吞吐见 [4b]（10 万行/秒，含双口径判定与行解析），"
@@ -1053,12 +1061,13 @@ void exp_e2e(int rounds, int pings) {
 
 // ---------------------------------------------------------------- main
 int main(int argc, char** argv) {
-  int trials = 10000, rounds = 5, pings = 20;
+  int trials = 10000, rounds = 5, pings = 20, flood = 0;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--trials") trials = std::atoi(argv[++i]);
     else if (a == "--rounds") rounds = std::atoi(argv[++i]);
     else if (a == "--pings") pings = std::atoi(argv[++i]);
+    else if (a == "--flood") flood = std::atoi(argv[++i]);
   }
   if (::geteuid() != 0) {
     std::fprintf(stderr, "需要 root（[7] 要建 netns 拓扑）：sudo ./build/exp\n");
@@ -1071,6 +1080,19 @@ int main(int argc, char** argv) {
   ::mkdir("results", 0755);
   ::mkdir(g_chart_dir.c_str(), 0755);
   ::mkdir(topo::workdir().c_str(), 0755);
+
+  // --flood N：单项洪灌测量（数据面优化前后受控对比），不触碰 exp_report.md
+  if (flood > 0) {
+    g_report.open("results/flood_report.md");
+    if (!g_report) {
+      std::fprintf(stderr, "无法写 results/flood_report.md\n");
+      return 2;
+    }
+    exp_flood(flood);
+    g_report.close();
+    std::printf("完成：results/flood_report.md\n");
+    return 0;
+  }
 
   g_report.open("results/exp_report.md");
   if (!g_report) {
