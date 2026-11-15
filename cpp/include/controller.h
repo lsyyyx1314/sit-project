@@ -56,8 +56,12 @@ class Controller {
   // 旧取证的包退化为候选对比定位）。取证行与其包上报行在文件中相邻（同一
   // 包的几跳取证间隔 ≈ 在途包数），2^14 已有数百倍余量——此前 2^20 配合
   // string 键最坏可膨胀到数百 MB。
+  // scheme21（M5.21）：MPV-2.1 逐包高保证模式——每跳独立 h-密钥，抗观测
+  // 回归伪造（报告 §21）。代价：验证 O(h)、CFMV 流级不可用（FLOW 行忽略）。
+  // replay_window：重放窗口容量（S3：洪灌挤窗的缓解面，默认 65536）。
   explicit Controller(uint64_t seed, const std::vector<Direction>& dirs,
-                      size_t trace_cap = 1 << 14);
+                      size_t trace_cap = 1 << 14, bool scheme21 = false,
+                      size_t replay_window = 1 << 16);
 
   // 处理一行上报；不是已知格式时返回 kind == "" 的事件
   Event feed(const std::string& line);
@@ -89,6 +93,7 @@ class Controller {
   std::vector<ExpectationTable> tables_;
   std::vector<DirStat> stats_;
   std::vector<NonceWindow> windows_;
+  bool scheme21_ = false;  // M5.21：MPV-2.1 逐包高保证模式
   // 取证表：键 = 方向下标(8b) | nonce(56b)，无字符串分配；单方向条目受
   // trace_cap 约束（世代清空）
   std::unordered_map<uint64_t, std::vector<HopTrace>> traces_;

@@ -25,9 +25,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -71,13 +73,24 @@ struct State {
   uint64_t traffic_packets = 0;               // 已触发 ping 数
   std::set<uint64_t> traced_h2, reported_h2;  // 黑洞检测用
   double started = 0;                         // 单调秒
+  uint64_t seq = 0;                           // M5.21/E2：状态版本号（长轮询用）
+  std::condition_variable cv;                 // seq 变化时唤醒长轮询等待者
 };
 
 State g_state;
 Controller* g_ctl = nullptr;  // 受 g_state.mu 保护
 uint32_t g_flow_window = 10;
 std::atomic<bool> g_traffic_running{false};
-void blackhole_check();  // 定义在交换机管理之后
+bool g_scheme21 = false;     // M5.21：MPV-2.1 双模式（--scheme 21）
+size_t g_window = 1 << 16;   // M5.21/S3：重放窗口容量（--window）
+void blackhole_sweep();      // 定义在交换机管理之后（F3：实时黑洞检测）
+
+// 长轮询等待：seq 超过 since 或超时返回（E2）
+void wait_for_seq(uint64_t since, double seconds) {
+  std::unique_lock<std::mutex> lk(g_state.mu);
+  g_state.cv.wait_for(lk, std::chrono::duration<double>(seconds),
+                      [&] { return g_state.seq > since; });
+}
 
 // 黑洞检测 nonce 集合上界（与控制器取证表同动机：长跑演示防无界增长；
 // 满后丢弃最旧语义由 reset 场景切换兜底）
@@ -120,13 +133,7 @@ void traffic_worker(int count) {
     g_state.traffic_packets += (uint64_t)count;
   }
   run_traffic(count, "0.04");
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
-  bool bh = false;
-  {
-    std::lock_guard<std::mutex> lk(g_state.mu);
-    bh = (g_state.scenario == "blackhole");
-  }
-  if (bh) blackhole_check();
+  // F3：黑洞定位已由 tailer 循环实时增量扫描（不再等批量比对）
   g_traffic_running = false;
 }
 
@@ -224,6 +231,11 @@ void push_event(const EventView& ev) {
                          g_state.events.begin() + (g_state.events.size() - kCap));
 }
 
+// F3 实时黑洞检测：TRACE 首见时刻（正向 h1→h2）
+std::map<uint64_t, double> g_traced_at;
+std::set<uint64_t> g_lost_reported;  // 已发过失联事件的 nonce（防重复）
+constexpr double kBlackholeGrace = 1.5;  // 秒：超过此时间无出口上报即判失联
+
 int dir_index(const std::string& mac) {
   for (size_t i = 0; i < 2; ++i)
     if (g_ctl->directions()[i].mac == mac) return (int)i;
@@ -241,8 +253,10 @@ void handle_line(const std::string& line) {
                     &d, &nonce) == 6 &&
         std::strcmp(mac, H2MAC) == 0 && a >= 1 && a <= kMaxSwitches &&
         b >= 1 && b <= kMaxPorts && c >= 1 && c <= kMaxPorts &&
-        g_state.traced_h2.size() < kNonceSetCap)
+        g_state.traced_h2.size() < kNonceSetCap) {
       g_state.traced_h2.insert(nonce);
+      if (!g_traced_at.count(nonce)) g_traced_at[nonce] = mono_s();
+    }
   }
   Event ev = g_ctl->feed(line);
   if (ev.kind.empty()) return;
@@ -287,9 +301,14 @@ void tailer_loop() {
   g_tail_trace.path = trace_path();
   while (true) {
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    std::lock_guard<std::mutex> lk(g_state.mu);
-    g_tail_trace.pump(handle_line);  // 取证先行（与控制器 localize 依赖一致）
-    g_tail_report.pump(handle_line);
+    {
+      std::lock_guard<std::mutex> lk(g_state.mu);
+      g_tail_trace.pump(handle_line);  // 取证先行（与控制器 localize 依赖一致）
+      g_tail_report.pump(handle_line);
+      blackhole_sweep();               // F3：实时黑洞检测（增量扫描）
+      ++g_state.seq;                   // E2：长轮询版本号推进
+    }
+    g_state.cv.notify_all();           // 唤醒 /api/state?since= 的长轮询等待者
   }
 }
 
@@ -302,6 +321,7 @@ void start_switches(const std::string& evil_s2, const std::string& evil_s3) {
     c.ports = ports;
     c.evil = evil;
     c.flow_window = g_flow_window;
+    c.scheme = g_scheme21 ? "21" : "20";  // M5.21：交换机与控制器模式一致
     return c;
   };
   g_pids.clear();
@@ -327,7 +347,8 @@ void reset_run(const std::string& scenario) {
   g_tail_trace.close();
   clear_logs();
   delete g_ctl;
-  g_ctl = new Controller(SEED, directions_for(scenario_tables(scenario)));
+  g_ctl = new Controller(topo::resolve_seed(), directions_for(scenario_tables(scenario)),
+                         1 << 14, g_scheme21, g_window);
   g_state.stats.assign(2, DirStat{});
   g_state.us_sum.assign(2, 0.0);
   g_state.us_cnt.assign(2, 0);
@@ -338,18 +359,26 @@ void reset_run(const std::string& scenario) {
   g_state.lost_suspects.clear();
   g_state.traced_h2.clear();
   g_state.reported_h2.clear();
+  g_traced_at.clear();
+  g_lost_reported.clear();
   g_state.scenario = scenario;
+  ++g_state.seq;          // 长轮询等待者立即看到 reset
+  g_state.cv.notify_all();
 }
 
-// 黑洞定位：取证里出现过、出口却没有上报的正向 nonce = 半路失联
-void blackhole_check() {
-  std::lock_guard<std::mutex> lk(g_state.mu);
+// 黑洞定位（F3 实时化）：tailer 每 120ms 增量扫描——TRACE 首见超过宽限期
+// 且出口仍未上报的正向 nonce = 半路失联，逐跳取证定位并推事件（每 nonce
+// 只报一次）。此前为批量事后比对（等一轮 ping 结束才检查）。
+void blackhole_sweep() {
   std::vector<uint64_t> lost;
-  for (uint64_t n : g_state.traced_h2)
-    if (!g_state.reported_h2.count(n)) lost.push_back(n);
-  g_state.lost_count = (int)lost.size();
-  g_state.lost_suspects.clear();
+  double now = mono_s();
+  for (const auto& kv : g_traced_at)
+    if (now - kv.second > kBlackholeGrace &&
+        !g_state.reported_h2.count(kv.first) && !g_lost_reported.count(kv.first))
+      lost.push_back(kv.first);
   for (uint64_t n : lost) {
+    g_lost_reported.insert(n);
+    g_state.lost_count++;
     int s = g_ctl->localize(0, 0, n, 0);  // 走取证前缀对照，acc 不参与
     if (s >= 0) g_state.lost_suspects.push_back(s);
     EventView v;
@@ -374,19 +403,27 @@ void blackhole_check() {
 std::string http_get(int fd, const std::string& path);
 std::string http_post(int fd, const std::string& path,
                       const std::string& body);
+std::string http_metrics();  // E4：Prometheus 文本格式（定义在 kPage 之后）
 
 void serve(int fd) {
-  // 连接级防护：读 2s / 写 5s 超时，防止空闲预连接泄漏线程
+  // 连接级防护（M5.21/S4）：读 2s / 写 5s 超时 + **连接绝对生命周期 10s**。
+  // 此前仅每次 recv 2s——slowloris（每 1.9s 发 1 字节）可永久占住连接，
+  // 32 个慢连接即耗尽连接池；绝对上限使其最多存活 10s。
   struct timeval rv{2, 0}, sv{5, 0};
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rv, sizeof(rv));
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sv, sizeof(sv));
   int one = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  const auto born = std::chrono::steady_clock::now();
+  auto expired = [&born] {
+    return std::chrono::steady_clock::now() - born > std::chrono::seconds(10);
+  };
 
   std::string req;
   char buf[4096];
   // 读完整个头部（\r\n\r\n），再按 Content-Length 收完 body
   while (req.find("\r\n\r\n") == std::string::npos && req.size() < 65536) {
+    if (expired()) break;  // slowloris 防护：绝对生命周期
     ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) break;
     req.append(buf, (size_t)n);
@@ -402,7 +439,7 @@ void serve(int fd) {
     content_len = (size_t)std::atoi(req.c_str() + cl + 15);
   auto body_start = req.find("\r\n\r\n");
   while (content_len > 0 && req.size() - body_start - 4 < content_len &&
-         req.size() < 1 << 20) {
+         req.size() < 1 << 20 && !expired()) {
     ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) break;
     req.append(buf, (size_t)n);
@@ -419,14 +456,18 @@ void serve(int fd) {
   // 鉴权在分发前统一做，任何新增 POST 接口默认被覆盖。
   std::string head = req.substr(0, body_start + 4);
   std::string resp;
-  if (method == "POST" && !mpv::write_authorized(head, g_admin_token)) {
+  if (expired()) {
+    resp = "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+  } else if (method == "POST" && !mpv::write_authorized(head, g_admin_token)) {
     std::fprintf(stderr, "[安全] 拒绝未授权 POST %s\n", path.c_str());
     resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n"
            "Content-Length: 0\r\n\r\n";
   } else if (method == "GET" && (path == "/" || path == "/index.html"))
     resp = http_get(fd, "/");
-  else if (method == "GET" && path == "/api/state")
-    resp = http_get(fd, path);
+  else if (method == "GET" && path.rfind("/api/state", 0) == 0)
+    resp = http_get(fd, path);  // E2：支持 ?since=<seq> 长轮询（最多等 4s）
+  else if (method == "GET" && path == "/metrics")
+    resp = http_metrics();  // E4：Prometheus 文本格式（只读，无需令牌）
   else if (method == "POST" && path == "/api/scenario")
     resp = http_post(fd, path, body);
   else if (method == "POST" && path == "/api/traffic")
@@ -472,6 +513,8 @@ std::string json_state() {
   std::ostringstream o;
   o << "{\"scenario\":\"" << esc(g_state.scenario) << "\"";
   o << ",\"uptime\":" << (mono_s() - g_started);
+  o << ",\"seq\":" << g_state.seq;
+  o << ",\"scheme21\":" << (g_scheme21 ? "true" : "false");
   o << ",\"suspect\":" << g_state.suspect;
   o << ",\"suspects\":[";
   for (size_t i = 0; i < g_state.suspects.size(); ++i) {
@@ -500,6 +543,8 @@ std::string json_state() {
       << ",\"cpmv\":" << s.cpmv_checks << ",\"bpmv\":" << s.bpmv_checks
       << ",\"cfmv\":" << s.cfmv_checks << ",\"avg_us\":" << avg << "}";
   }
+  o << "]";  // M5.21：补回 dirs 数组闭合——此前缺失使 /api/state 恒为非法
+             // JSON，浏览器 UI 的 try/catch 静默吞错，页面冻结在零值
   o << ",\"rss_kb\":" << [&] {
     unsigned long long rss_kb = 0;
     if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
@@ -741,8 +786,10 @@ const suspectRing=id=>{const g=document.getElementById("g_"+id);if(!g)return;
  g.appendChild(r);setTimeout(()=>r.remove(),6000)};
 const S={last:0,shownSuspect:-1,scen:"",rings:new Set()};
 function fmt(n){return n.toLocaleString("en-US")}
-async function refresh(){
- try{const r=await fetch("/api/state");const j=await r.json();
+let SSEQ=0;
+async function refresh(j){
+ if(j===undefined){const r=await fetch("/api/state");j=await r.json();}
+ SSEQ=j.seq??SSEQ;
  document.getElementById("scenlabel").textContent="当前场景："+({normal:"正常转发",tagflip:"标签错配",blackhole:"路径偏离(黑洞)",bitflip:"恶意改头(s2)",dup:"恶意重放(s2)",failover:"链路故障切换",multifault:"多重故障(改道+改头)"})[j.scenario];
  const f=j.dirs[0],rv=j.dirs[1];
  const pass=f.pass+rv.pass,fail=f.fail+rv.fail,rp=f.replays+rv.replays;
@@ -804,9 +851,14 @@ async function refresh(){
  // 场景按钮态
  document.querySelectorAll("[data-sc]").forEach(b=>b.classList.toggle("on",b.dataset.sc===j.scenario));
  S.scen=j.scenario;
- }catch(e){}
 }
-setInterval(refresh,700);refresh();
+// E2：长轮询——服务端在 seq 推进时立即返回（事件延迟 ~120ms），无事件时
+// 最多挂 4s；不再固定 700ms 盲轮询。等待期间释放线程（fetch 异步）。
+async function poll(){
+ try{const r=await fetch("/api/state?since="+SSEQ);if(r.ok){const j=await r.json();await refresh(j);}}catch(e){}
+ setTimeout(poll,60);
+}
+poll();
 document.querySelectorAll("[data-sc]").forEach(b=>b.onclick=async()=>{
  await fetch("/api/scenario",{method:"POST",body:JSON.stringify({name:b.dataset.sc})});
  S.last=0;S.shownSuspect=-1;S.rings.clear();refresh()});
@@ -828,8 +880,45 @@ document.getElementById("send100").onclick=()=>send(100);
  const t1=el("text",{x:px+8,y:py+8,"font-size":"11",fill:"#60a5fa"});t1.textContent="tag（CPMV）≈0.3µs，与 k 无关";c.appendChild(t1)})();
 </script></body></html>)HTML";
 
+// E4：Prometheus 文本格式观测端点（只读、无需令牌——绑定回环时仅本机可达）
+std::string http_metrics() {
+  std::lock_guard<std::mutex> lk(g_state.mu);
+  std::ostringstream o;
+  o << "# MPV-2 metrics（Prometheus text format, M5.21/E4）\n";
+  for (size_t d = 0; d < g_state.stats.size(); ++d) {
+    const DirStat& s = g_state.stats[d];
+    o << "mpv_packets_total{dir=\"" << d << "\",verdict=\"pass\"} " << s.pass << "\n";
+    o << "mpv_packets_total{dir=\"" << d << "\",verdict=\"fail\"} " << s.fail << "\n";
+    o << "mpv_replays_total{dir=\"" << d << "\"} " << s.replays << "\n";
+    o << "mpv_localized_total{dir=\"" << d << "\"} " << s.localized << "\n";
+    o << "mpv_flows_total{dir=\"" << d << "\"} " << s.flows << "\n";
+    o << "mpv_flow_pass_total{dir=\"" << d << "\"} " << s.flow_pass << "\n";
+    o << "mpv_flow_fail_total{dir=\"" << d << "\"} " << s.flow_fail << "\n";
+    o << "mpv_cpmv_checks_total{dir=\"" << d << "\"} " << s.cpmv_checks << "\n";
+    o << "mpv_bpmv_checks_total{dir=\"" << d << "\"} " << s.bpmv_checks << "\n";
+  }
+  o << "mpv_lost_packets_total " << g_state.lost_count << "\n";
+  o << "mpv_traffic_packets_total " << g_state.traffic_packets << "\n";
+  unsigned long long rss_kb = 0;
+  if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+    long long tot = 0, res = 0;
+    if (std::fscanf(f, "%lld %lld", &tot, &res) == 2) rss_kb = (unsigned long long)res * 4;
+    std::fclose(f);
+  }
+  o << "mpv_rss_kb " << rss_kb << "\n";
+  o << "mpv_uptime_seconds " << (long long)((mono_s() - g_started)) << "\n";
+  o << "mpv_scheme21 " << (g_scheme21 ? 1 : 0) << "\n";
+  return "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " +
+         std::to_string(o.str().size()) + "\r\n\r\n" + o.str();
+}
+
 std::string http_get(int, const std::string& path) {
-  if (path == "/api/state") {
+  // E2 长轮询：/api/state?since=<seq> —— seq 未推进时最多等 4s（条件变量
+  // 由 tailer 循环在每轮处理末唤醒），事件到达延迟从 700ms 轮询降到 ~120ms
+  if (path.rfind("/api/state", 0) == 0) {
+    auto q = path.find("?since=");
+    if (q != std::string::npos)
+      wait_for_seq(std::strtoull(path.c_str() + q + 7, nullptr, 10), 4.0);
     std::string body = json_state();
     return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
            std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -870,6 +959,8 @@ int main(int argc, char** argv) {
     if (a == "--port") port = std::atoi(argv[++i]);
     else if (a == "--bind") bind_addr = argv[++i];
     else if (a == "--token") token_arg = argv[++i];
+    else if (a == "--scheme") g_scheme21 = std::string(argv[++i]) == "21";
+    else if (a == "--window") g_window = (size_t)std::atoll(argv[++i]);
     else if (a == "--flow-window") g_flow_window = (uint32_t)std::atoi(argv[++i]);
   }
   g_admin_token = token_arg ? std::string(token_arg) : random_token_hex();
@@ -895,7 +986,8 @@ int main(int argc, char** argv) {
   write_tables(Scenario::kNormal);
   apply_link_state(Scenario::kNormal);
   clear_logs();
-  g_ctl = new Controller(SEED, directions_for(Scenario::kNormal));
+  g_ctl = new Controller(topo::resolve_seed(), directions_for(Scenario::kNormal),
+                         1 << 14, g_scheme21, g_window);
   g_state.stats.assign(2, DirStat{});
   start_switches("none", "none");
 
@@ -939,6 +1031,10 @@ int main(int argc, char** argv) {
 
   std::printf("MPV-2 演示控制台已启动：http://%s:%d  （Ctrl-C 退出并清理拓扑）\n",
               bind_addr, port);
+  std::printf("[运行] seed=%llu scheme=MPV-%s replay_window=%zu\n"
+              "[运行] MPV_SEED 环境变量可固定种子复现实验\n",
+              (unsigned long long)topo::resolve_seed(), g_scheme21 ? "2.1" : "2.0",
+              g_window);
   std::printf("[安全] 管理令牌（POST 接口需要 X-MPV-Token 头或浏览器 Cookie）：\n"
               "[安全]   %s\n"
               "[安全] 浏览器无需输入：首次打开页面时已自动下发 Cookie。\n",

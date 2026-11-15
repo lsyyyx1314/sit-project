@@ -21,14 +21,17 @@ constexpr size_t kTraceHopsMax = 64;
 }  // namespace
 
 Controller::Controller(uint64_t seed, const std::vector<Direction>& dirs,
-                       size_t trace_cap)
+                       size_t trace_cap, bool scheme21, size_t replay_window)
     : kr_(KeyRing::generate(kMaxSwitches, kMaxPorts, seed)),
       dirs_(dirs),
+      scheme21_(scheme21),
       trace_cap_(trace_cap ? trace_cap : 1) {
   tables_.reserve(dirs.size());
   stats_.resize(dirs.size());
-  windows_.resize(dirs.size());
-  for (const Direction& d : dirs) tables_.emplace_back(kr_, d.paths);
+  for (size_t i = 0; i < dirs.size(); ++i) {
+    tables_.emplace_back(kr_, dirs[i].paths);
+    windows_.emplace_back(replay_window);
+  }
 }
 
 int Controller::dir_of(const std::string& mac) const {
@@ -111,10 +114,38 @@ Event Controller::feed_packet(const std::string& line) {
 
   ++st.packets;
   const Header h{nonce, acc, (uint8_t)tag};
-
-  // 公开哈希一次，tag/scan 双口径共用（h_of 占单次判定 ~99% 时间）
-  uint64_t hh = h_of(nonce);
   double t0 = now_us();
+
+  if (scheme21_) {
+    // MPV-2.1：一次预计算全部交换机的 h'（每包 kMaxSwitches 次 PRF），
+    // tag21/scan21 复用——避免 scan21 每候选×每跳重复求值。
+    uint64_t hp[kMaxSwitches + 1];
+    kr_.prime_h21(nonce, hp);
+    Verdict v = tables_[(size_t)d].verify_tag21(h, hp);
+    double t1 = now_us();
+    ev.verify_us = t1 - t0;
+    ++st.cpmv_checks;
+    Verdict sc = tables_[(size_t)d].verify_scan21(h, hp);
+    st.bpmv_checks += (uint64_t)sc.checks;
+
+    if (v.ok) {
+      ++st.pass;
+      ev.ok = true;
+      ev.matched = v.matched;
+      return ev;
+    }
+    ++st.fail;
+    ev.matched = sc.matched;
+    ev.suspects = localize_all((size_t)d, (uint8_t)tag, nonce, acc);
+    if (!ev.suspects.empty()) {
+      ev.suspect_sid = ev.suspects.front();
+      ++st.localized;
+    }
+    return ev;
+  }
+
+  // MPV-2.0：公开哈希一次，tag/scan 双口径共用（h_of 占单次判定 ~99% 时间）
+  uint64_t hh = h_of(nonce);
   Verdict v = tables_[(size_t)d].verify_tag(h, hh);
   double t1 = now_us();
   ev.verify_us = t1 - t0;
@@ -157,6 +188,9 @@ Event Controller::feed_flow(const char* p) {
 
   int d = dir_of(mac);
   if (d < 0) return ev;
+  // M5.21：MPV-2.1 模式下 CFMV 流级不可用（逐跳 h' 破坏线性恒等式，
+  // 见报告 §21.2）——FLOW 行按无法处理忽略，不产生判定事件。
+  if (scheme21_) return Event{};
   DirStat& st = stats_[(size_t)d];
   ev.claimed = (int)tag;
 
@@ -236,11 +270,17 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
   const uint64_t tkey = ((uint64_t)dir << 56) | (uint64_t)nonce;
   auto it = traces_.find(tkey);
 
-  uint64_t hh = h_of(nonce);
+  // M5.21：2.0 用单一公开 hh = h_of(nonce)；2.1 每跳用自己的 h'_i。
+  uint64_t hp[kMaxSwitches + 1];
+  if (scheme21_) kr_.prime_h21(nonce, hp);
+  auto hop_hh = [&](const Hop& hop) {
+    return scheme21_ ? kr_.h21(hop.sid, nonce) : h_of(nonce);
+  };
   if (it == traces_.end() || it->second.empty()) {
     // 无取证：候选对比，声称路径与实际命中路径的首个分歧交换机
     // （复用已构建的期望表；此前此处每次重建 O(k·h)，纯浪费）
-    Verdict sc = tables_[dir].verify_scan(Header{nonce, acc, tag});
+    Verdict sc = scheme21_ ? tables_[dir].verify_scan21(Header{nonce, acc, tag}, hp)
+                           : tables_[dir].verify_scan(Header{nonce, acc, tag});
     if (sc.matched < 0) return out;
     const Path& actual = dirs_[dir].paths[(size_t)sc.matched];
     size_t common = 0;
@@ -262,7 +302,7 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
   for (size_t i = 0; i < recs.size(); ++i) {
     const HopTrace& r = recs[i];
     Hop hop{r.sid, r.in_port, r.out_port};
-    uint64_t expect = addmod(carry, mulmod(contribution(kr_, hop, hh),
+    uint64_t expect = addmod(carry, mulmod(contribution(kr_, hop, hop_hh(hop)),
                                            powmod(RHO, (uint64_t)i)));
     if (r.v_after != expect) out.push_back((int)r.sid);  // 本跳篡改嫌疑
     carry = r.v_after;  // 以观测值为准，让后续跳的期望建立在实际上
@@ -284,7 +324,7 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
     uint64_t expect_total = 0;
     for (size_t j = 0; j < claimed.size(); ++j)
       expect_total =
-          addmod(expect_total, mulmod(contribution(kr_, claimed[j], hh),
+          addmod(expect_total, mulmod(contribution(kr_, claimed[j], hop_hh(claimed[j])),
                                       powmod(RHO, (uint64_t)j)));
     if (acc != expect_total) out.push_back((int)claimed.back().sid);
   }

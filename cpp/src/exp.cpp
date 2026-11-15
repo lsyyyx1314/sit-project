@@ -1088,7 +1088,7 @@ void exp_e2e(int rounds, int pings) {
   {
     RoundStat rs;
     for (int r = 0; r < rounds; ++r) {
-      Controller ctl(SEED, directions());
+      Controller ctl(topo::resolve_seed(), directions());
       auto evs = run_e2e_round(Scenario::kTagflip, "none", pings, ctl);
       const DirStat& f = ctl.stat(0);
       const DirStat& rv = ctl.stat(1);
@@ -1105,7 +1105,7 @@ void exp_e2e(int rounds, int pings) {
   {
     RoundStat rs;
     for (int r = 0; r < rounds; ++r) {
-      Controller ctl(SEED, directions());
+      Controller ctl(topo::resolve_seed(), directions());
       auto evs = run_e2e_round(Scenario::kNormal, "bitflip", pings, ctl);
       const DirStat& f = ctl.stat(0);
       const DirStat& rv = ctl.stat(1);
@@ -1122,7 +1122,7 @@ void exp_e2e(int rounds, int pings) {
   {
     RoundStat rs;
     for (int r = 0; r < rounds; ++r) {
-      Controller ctl(SEED, directions());
+      Controller ctl(topo::resolve_seed(), directions());
       auto evs = run_e2e_round(Scenario::kNormal, "dup", pings, ctl);
       const DirStat& f = ctl.stat(0);
       const DirStat& rv = ctl.stat(1);
@@ -1138,7 +1138,7 @@ void exp_e2e(int rounds, int pings) {
   {
     RoundStat rs;
     for (int r = 0; r < rounds; ++r) {
-      Controller ctl(SEED, directions());
+      Controller ctl(topo::resolve_seed(), directions());
       run_e2e_round(Scenario::kBlackhole, "none", pings, ctl);
       ++rs.rounds;
       // 集合差：失联 nonce

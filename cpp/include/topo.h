@@ -27,6 +27,11 @@ constexpr uint64_t SEED = 20260501;
 std::string workdir();
 std::string ns_prefix();
 
+// 运行种子（M5.21/S2）：默认每次运行由内核 CSPRNG 随机生成——硬编码公开
+// 种子等于公开全部密钥（GitHub 上有源码）。MPV_SEED=<n> 环境变量可固定种子
+// 复现实验；e2e/dashboard 启动时打印所选种子。
+uint64_t resolve_seed();
+
 // 目录加固（M5.19）：确保工作目录存在并把权限收紧到 0700（多实例按 MPV_WORK
 // 隔离的每个目录各自生效）；目录内 report/trace 由 vswitch/dashboard 的
 // umask(077) 落成 0600——本机其他低权限用户不可读验证数据与取证文件。
@@ -44,6 +49,8 @@ struct SwitchConf {
   std::string evil = "none";       // none | bitflip | dup
   bool trace = true;
   uint32_t flow_window = 32;
+  uint64_t seed = 0;               // 0 = 运行时用 resolve_seed()（M5.21/S2）
+  std::string scheme = "20";       // MPV 方案：20（默认）| 21（逐包高保证）
 };
 
 std::string table_path(int sid);
@@ -61,6 +68,8 @@ void stop_switch(pid_t pid);
 
 // ping 流量：h1 → h2，返回实际发送条数
 void run_traffic(int count, const std::string& interval = "0.05");
+// IPv6 流量（F6/M5.21）：h1 → h2 over ULA
+void run_traffic6(int count, const std::string& interval = "0.05");
 
 // 候选路径与方向定义（控制器用）
 std::vector<mpv::Path> cand_fwd();

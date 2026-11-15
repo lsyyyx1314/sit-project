@@ -628,6 +628,86 @@ static void controller_tests() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MPV-2.1 逐包高保证模式（M5.21）：每跳独立 h-密钥
+// ---------------------------------------------------------------------------
+
+static uint64_t subm21(uint64_t a, uint64_t b) {
+  return (uint64_t)(((unsigned __int128)P + a - b) % P);
+}
+
+static void mpv21_tests() {
+  const uint64_t seed = 0x21F00D;
+  KeyRing kr = KeyRing::generate(16, 4, seed);
+  Path p0 = make_path({1, 2, 3, 4});
+  Path p1 = make_path({1, 5, 3, 4});
+  std::vector<Path> cands{p0, p1};
+  ExpectationTable t21(kr, cands);
+
+  uint64_t n1 = 1000, n2 = 1001, nF = 0xDEADBEEF;
+  uint64_t hp1[kMaxSwitches + 1], hp2[kMaxSwitches + 1], hpF[kMaxSwitches + 1];
+  kr.prime_h21(n1, hp1);
+  kr.prime_h21(n2, hp2);
+  kr.prime_h21(nF, hpF);
+  CHECK_EQ(hp1[1], kr.h21(1, n1), "prime_h21 与 h21 一致");
+  CHECK_EQ(hp1[4], kr.h21(4, n1), "prime_h21 覆盖交换机 4");
+
+  Header h1 = forward21(kr, p0, 0, n1);
+  Header h2 = forward21(kr, p0, 0, n2);
+  Verdict v = t21.verify_tag21(h1, hp1);
+  CHECK(v.ok && v.matched == 0, "2.1 诚实包 tag21 通过");
+  CHECK(t21.verify_tag21(h2, hp2).ok, "2.1 第二包 tag21 通过");
+
+  Header bad = h1;
+  bad.acc ^= 1;
+  CHECK(!t21.verify_tag21(bad, hp1).ok, "2.1 比特翻转被拒");
+
+  Header spoof = h1;
+  spoof.tag = 1;
+  Verdict sc = t21.verify_scan21(spoof, hp1);
+  CHECK(sc.ok && sc.matched == 0, "2.1 scan21 识别真实路径");
+
+  // 回归攻击（M5.20 发现）：2 个公开观测 + 公开 h_of 拟合 → 伪造被拒
+  uint64_t hA = h_of(n1), hB = h_of(n2);
+  uint64_t B = mulmod(subm21(h1.acc, h2.acc), powmod(subm21(hA, hB), P - 2));
+  uint64_t A = subm21(h1.acc, mulmod(B, hA));
+  Header forge{};
+  forge.nonce = nF;
+  forge.tag = 0;
+  forge.acc = addmod(A, mulmod(B, h_of(nF)));
+  CHECK(!t21.verify_tag21(forge, hpF).ok, "2.1 公开回归伪造被拒");
+
+  // 恶意出口（知道自己的 k'_4/h'_4 + 两观测）按自身 h' 拟合伪造 → 被拒
+  uint64_t e1 = kr.h21(4, n1), e2 = kr.h21(4, n2), eF = kr.h21(4, nF);
+  B = mulmod(subm21(h1.acc, h2.acc), powmod(subm21(e1, e2), P - 2));
+  A = subm21(h1.acc, mulmod(B, e1));
+  forge.acc = addmod(A, mulmod(B, eF));
+  CHECK(!t21.verify_tag21(forge, hpF).ok, "2.1 恶意出口仿造被拒（需全前缀合谋）");
+
+  // Controller 21 模式：诚实通过 / 重放拦截 / FLOW 行忽略
+  {
+    Controller c21(seed, {{"aa:aa:aa:aa:aa:01", cands}}, 1 << 12, true, 4096);
+    char line[160];
+    std::snprintf(line, sizeof(line), "4 0 %llu %llu aa:aa:aa:aa:aa:01",
+                  (unsigned long long)h1.nonce, (unsigned long long)h1.acc);
+    Event ev = c21.feed(line);
+    CHECK(ev.kind == "packet" && ev.ok, "2.1 控制器诚实上报通过");
+    ev = c21.feed(line);
+    CHECK(ev.replay, "2.1 重放仍被窗口拦截");
+    ev = c21.feed(std::string("FLOW aa:aa:aa:aa:aa:01 0 10 1 2 3"));
+    CHECK(ev.kind == "", "2.1 模式下 FLOW 行按不可处理忽略");
+  }
+
+  // S3：大窗口语义（65536 容量：最旧淘汰后允许重放通过）
+  {
+    NonceWindow w(1 << 16);
+    for (uint64_t i = 0; i < (1 << 16); ++i) w.see(0x50000000ULL + i);
+    CHECK(w.see(0x60000000ULL), "S3 大窗口：新 nonce 进入并淘汰最旧");
+    CHECK(w.see(0x50000000ULL), "S3 大窗口：被淘汰的最旧 nonce 按新包处理");
+    CHECK(!w.see(0x50000000ULL + (1 << 16) - 1), "S3 大窗口：窗口内 nonce 仍判重");
+  }
+}
+
 int main(int argc, char** argv) {
   const char* golden = (argc > 1) ? argv[1] : "../results/golden_vectors.txt";
 
@@ -650,6 +730,11 @@ int main(int argc, char** argv) {
   before = g_pass;
   std::printf("== 4. 控制器判定与取证定位 ==\n");
   controller_tests();
+  std::printf("   新增 %d 项\n", g_pass - before);
+
+  before = g_pass;
+  std::printf("== 5. MPV-2.1 逐包高保证模式 ==\n");
+  mpv21_tests();
   std::printf("   新增 %d 项\n", g_pass - before);
 
   std::printf("\n结果：通过 %d，失败 %d\n", g_pass, g_fail);

@@ -23,7 +23,8 @@
 ### 演示 APP
 
 ```bash
-sudo ./cpp/build/dashboard --port 8080 --bind 0.0.0.0   # 局域网浏览器访问
+sudo ./cpp/build/dashboard --port 8080 --bind 0.0.0.0            # 局域网浏览器访问（MPV-2.0+CFMV）
+sudo ./cpp/build/dashboard --port 8080 --bind 0.0.0.0 --scheme 21  # MPV-2.1 逐包高保证档（无 CFMV）
 # 浏览器打开 http://<VM地址>:8080（POST 接口需启动时打印的管理令牌；
 # 不加 --bind 默认仅本机 127.0.0.1 可达——安全默认，见 M5.19）
 ```
@@ -86,6 +87,9 @@ VM 实测核心数字（完整数据见 `results/exp_report.md`）：
 | M5.18 | 优化空间分析（`docs/优化空间分析报告.md`）与落地：P0 安全加固——上报行边界校验（TRACE 越界 sid/端口、越界 tag 此前可单行击穿控制器，模糊测试发现并最小复现）、单 nonce 取证条目上界；FLOW/TRACE 手写解析（3.1×/5×）；`-O3 -flto`（scan ≈2.5×）+ Makefile 自动依赖；NonceWindow 分支回卷；断言 716→727（新增 11 项对抗），e2e R1–R7、ASan/UBSan、200 万次模糊测试全过 | ✅ |
 | M5.19 | 部署安全加固（Jupyter/Minikube 行业范式）：dashboard 默认回环绑定 + `--bind` 显式暴露；CSPRNG 管理令牌门禁全部 POST（X-MPV-Token 头 / HttpOnly+SameSite=Strict Cookie，UI 零改动，常数时间比较）；工作目录 0700 + vswitch/dashboard umask(077)（report/trace 落盘 0600）；MPV_NS 白名单防 shell 注入；新增 `include/webauth.h` 授权原语；断言 727→743（+16 项含 20000 次随机头块对抗）；VM 冒烟实测：无令牌/错误令牌/跨站伪造均 401，带令牌与浏览器 Cookie 全链路 200，外部暴露门禁生效 | ✅ |
 | M5.20 | 自研算法演进研究：发现并 PoC 证实**观测回归攻击**（2 个公开观测恢复 (A,B)，幽灵上报与 CFMV 窗口均被控制器接受——十类矩阵未覆盖的新攻击类，"1/p" 声明需按报告 §21 限定）；证明 CFMV 压缩与抗出口伪造不可兼得（定理级取舍）；提出并 PoC 验证 **MPV-2.1 融合方案**（每交换机独立 h-密钥，Wegman-Carter 化）：公开回归伪造与持自身密钥的恶意出口仿造均被拒，安全性归约到 PRF；工程路线（双模式/概率审计/128-bit）入报告 §21.4 | ✅（PoC 级；生产化见 §21.4） |
+| M5.21 | 部署与安全收口（S1–S4）：**MPV-2.1 双模式落地**（vswitch/controller/verify_reports `--scheme 21`，每交换机独立 h-密钥，控制器 prime_h21 一次预计算复用，CFMV 在 21 模式禁用并文档化；bench 新增 2.1 时延行：tag21 ≈0.17µs、scan21 k=16 ≈3.2µs）；**运行种子随机化**（getrandom + MPV_SEED 复现开关，消灭硬编码公开种子）；重放窗口 4096→65536 可调（洪灌挤窗缓解面）；dashboard 慢连接绝对生命周期 10s（slowloris 防护） | ✅ |
+| M5.22 | 效率与观测（E1/E2/E4）：vswitch **sendmmsg TX 批量**（arena 零堆分配，与 recvmmsg 对称；交错对照实测墙钟增益被环境噪声淹没、CPU/行微降——与 §19 socket 层结论一致，如实记录）；`/api/state?since=` **长轮询**（事件延迟 ~700ms→~120ms）；**/metrics** Prometheus 文本端点；修复 **/api/state 自初版起 dirs 数组缺失 `]`** 的历史遗留 JSON bug（旧 UI try/catch 静默吞错、页面冻结零值——浏览器截图对比确证） | ✅ |
+| M5.23 | 功能补全（F3/F6）：**实时黑洞检测**（tailer 增量扫描 + 1.5s 宽限期 + 每 nonce 单次事件，替代批量事后比对）；**IPv6 透传**（vswitch 接受 0x86DD、剥离按载荷版本恢复 ethertype——修复 IPv6 载荷被还原成 0x0800 畸形帧的 R8 根因；topo 配置 ULA fd00:1::/64 + 修复接口级 accept_dad 时序）；e2e 增至**八轮**（R8 IPv6 正常转发全过） | ✅ |
 | M6 | 论文与结题 | 论文草稿就位（`docs/结题论文草稿-面向SDN的高效多路径验证.md`），实验数据齐备 |
 
 ---

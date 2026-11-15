@@ -51,7 +51,7 @@ struct RoundResult {
 std::vector<Event> run_round(const std::string& name, Scenario sc,
                              const std::string& evil_s2,
                              const std::string& evil_s3, int pings,
-                             Controller& ctl) {
+                             Controller& ctl, bool use_v6 = false) {
   std::printf("\n== %s ==\n", name.c_str());
   std::fflush(stdout);
 
@@ -74,7 +74,10 @@ std::vector<Event> run_round(const std::string& name, Scenario sc,
   pids.push_back(spawn_switch(g_vswitch, mk(4, {"1:s4p1", "2:s4p2", "3:s4p3"})));
   ::sleep(1);
 
-  run_traffic(pings);
+  if (use_v6)
+    run_traffic6(pings);  // F6（M5.21）：IPv6 载荷
+  else
+    run_traffic(pings);
 
   ::sleep(1);
   for (pid_t p : pids) stop_switch(p);  // SIGTERM 触发流级窗口冲刷
@@ -137,9 +140,11 @@ int main() {
     return 2;
   }
   topo::harden_workdir();  // M5.19：0700
+  std::printf("运行种子 seed=%llu（MPV_SEED 可固定复现）\n",
+              (unsigned long long)topo::resolve_seed());
 
   std::printf("================================================================\n");
-  std::printf("MPV-2 端到端验证 · C++ 软件交换机 4 台 · 七轮场景\n");
+  std::printf("MPV-2 端到端验证 · C++ 软件交换机 4 台 · 八轮场景\n");
   std::printf("================================================================\n");
 
   const int PINGS = 20;
@@ -147,7 +152,7 @@ int main() {
 
   // ------------------------------------------------------------ R1 正常
   {
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     auto evs = run_round("R1 正常转发", Scenario::kNormal, "none", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
@@ -162,7 +167,7 @@ int main() {
 
   // ------------------------------------------------------------ R2 标签错配
   {
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     auto evs = run_round("R2 标签错配", Scenario::kTagflip, "none", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
     print_dir("反向", 1, ctl);
@@ -177,7 +182,7 @@ int main() {
 
   // ------------------------------------------------------------ R3 恶意改头
   {
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     auto evs = run_round("R3 恶意交换机·比特翻转", Scenario::kNormal,
                          "bitflip", "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
@@ -194,7 +199,7 @@ int main() {
 
   // ------------------------------------------------------------ R4 恶意重放
   {
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     auto evs = run_round("R4 恶意交换机·重放", Scenario::kNormal, "dup",
                          "none", PINGS, ctl);
     print_dir("正向", 0, ctl);
@@ -208,7 +213,7 @@ int main() {
 
   // ------------------------------------------------------------ R5 流级压缩
   {
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     run_round("R5 流级压缩（CFMV）", Scenario::kNormal, "none", "none", PINGS, ctl);
     const DirStat& f = ctl.stat(0);
     const DirStat& r = ctl.stat(1);
@@ -226,7 +231,7 @@ int main() {
   {
     // s1–s2 链路物理 down，tag0 全网切到 P1 分支，控制器候选集收敛为 {P1}：
     // 切换后验证继续全通过、零误报 —— 验证机制与重路由协同
-    Controller ctl(SEED, directions_for(Scenario::kFailover));
+    Controller ctl(topo::resolve_seed(), directions_for(Scenario::kFailover));
     auto evs = run_round("R6 链路故障切换", Scenario::kFailover, "none", "none",
                          PINGS, ctl);
     print_dir("正向", 0, ctl);
@@ -243,7 +248,7 @@ int main() {
   {
     // 双故障：s1 标签错配（改道 P1）+ s3 比特翻转。定位应同时报出 {s1, s3}：
     // s1 = 改道/改端口嫌疑（位置偏离），s3 = 篡改嫌疑（观测值偏离）
-    Controller ctl(SEED, directions());
+    Controller ctl(topo::resolve_seed(), directions());
     auto evs = run_round("R7 多重故障（改道+改头）", Scenario::kTagflip, "none",
                          "bitflip", PINGS, ctl);
     print_dir("正向", 0, ctl);
@@ -265,6 +270,22 @@ int main() {
                             "双故障应全检出且同时定位 s1 与 s3，反向不受影响"));
   }
 
+  // ------------------------------------------------------------ R8 IPv6
+  {
+    // F6（M5.21）：验证数据面与载荷协议无关——同样 16B 验证头包 IPv6 载荷。
+    Controller ctl(topo::resolve_seed(), directions());
+    auto evs = run_round("R8 IPv6 正常转发", Scenario::kNormal, "none", "none",
+                         PINGS, ctl, /*use_v6=*/true);
+    print_dir("正向", 0, ctl);
+    print_dir("反向", 1, ctl);
+    const DirStat& f = ctl.stat(0);
+    const DirStat& r = ctl.stat(1);
+    results.push_back(check("R8", f.fail == 0 && r.fail == 0 && f.pass > 0 &&
+                                      r.pass > 0,
+                            "IPv6 载荷应与 IPv4 等价验证通过"));
+    (void)evs;
+  }
+
   // ------------------------------------------------------------ 汇总
   std::printf("\n----------------------------------------------------------------\n");
   int bad = 0;
@@ -279,6 +300,6 @@ int main() {
     std::printf("结论：%d 轮未通过\n", bad);
     return 1;
   }
-  std::printf("结论：R1–R7 全部通过 —— 端到端验证成立\n");
+  std::printf("结论：R1–R8 全部通过 —— 端到端验证成立\n");
   return 0;
 }

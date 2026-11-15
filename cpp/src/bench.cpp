@@ -238,6 +238,47 @@ int main(int argc, char** argv) {
     std::printf("| %-2u | %8.3f | %9.3f |\n", k, median(tt), median(ts));
   }
 
+  // --------------------------- MPV-2.1 逐包高保证模式（M5.21）-----------------
+  // 每跳独立 h-密钥：h'_i = PRF_{k'_i}(nonce)。验证为逐跳重算（O(h)/O(k·h)），
+  // h' 预计算（prime_h21）每包一次、tag21/scan21 共用。换取：观测回归伪造被
+  // 阻断（报告 §21）。代价在此如实测量。
+  std::printf("\nMPV-2.1 判定时延（7 跳，命中最末候选，含 prime_h21 摊销前口径）\n");
+  std::printf("| k  | tag21 (us) | scan21 (us) |\n| -- | ---------- | ----------- |\n");
+  for (uint32_t k : {1u, 8u, 16u, 64u}) {
+    std::vector<Path> cands;
+    for (uint32_t i = 0; i < k; ++i) {
+      Path p;
+      p.push_back(Hop{1, 1, 2});
+      p.push_back(Hop{2, 1, 2});
+      p.push_back(Hop{3, 1, 2});
+      uint32_t x = i;
+      p.push_back(Hop{4 + (x % 11), 1, 2});
+      x /= 11;
+      p.push_back(Hop{4 + (x % 11), 1, 3});
+      p.push_back(Hop{15, 1, 2});
+      p.push_back(Hop{16, 1, 2});
+      cands.push_back(p);
+    }
+    ExpectationTable tb(kr, cands);
+    Header hdr = forward21(kr, cands[k - 1], (uint8_t)((k - 1) & 0xff), rng.nonce());
+    uint64_t hp[kMaxSwitches + 1];
+    kr.prime_h21(hdr.nonce, hp);
+    std::vector<double> tt, ts;
+    for (int i = 0; i < 2000; ++i) {
+      double t0 = now_us();
+      tb.verify_tag21(hdr, hp);
+      tt.push_back(now_us() - t0);
+      t0 = now_us();
+      tb.verify_scan21(hdr, hp);
+      ts.push_back(now_us() - t0);
+    }
+    double tp0 = now_us();
+    kr.prime_h21(hdr.nonce, hp);
+    double prime_us = now_us() - tp0;
+    std::printf("| %-2u | %10.3f | %11.3f |   (prime_h21=%.3f us)\n", k,
+                median(tt), median(ts), prime_us);
+  }
+
   // ------------------------------------------------- 多候选攻击矩阵（M3）
   std::printf("\n多候选集下的攻击检出（k 条合法路径共用一张期望表）\n");
   std::printf("| k  | 诚实接受          | 篡改检出          |\n");

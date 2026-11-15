@@ -64,6 +64,17 @@ class KeyRing {
 
   uint64_t port_key(const Hop& h) const; // 式 (2)：k_i ⊕ k_in ⊕ k_out 再派生
   HopKey hop_key(const Hop& h) const;    // 备忘录化：同一跳只派生一次
+  uint64_t seed() const { return seed_; }
+
+  // ------------------------------------------------ MPV-2.1（M5.21）
+  // 每交换机独立 h-密钥：h'_i = PRF_{k'_i}(nonce)，k'_i 只在本交换机的
+  // 贡献计算中使用。观测者/出口无法对"未处理过的 nonce"求值 h'，从而
+  // 无法利用线性回归伪造上报（M5.20 发现的攻击类，见报告 §21）。
+  uint64_t switch_hkey(uint32_t sid) const;          // k'_sid（备忘录化）
+  uint64_t h21(uint32_t sid, uint64_t nonce) const;  // PRF 求值
+  // 一次把全部交换机的 h' 算好（控制器每包一次，tag21/scan21 复用）。
+  // out 大小 ≥ kMaxSwitches+1，下标 1..kMaxSwitches 有效（out[0] 恒 0）。
+  void prime_h21(uint64_t nonce, uint64_t* out) const;
 
  private:
   struct SwitchKeys {
@@ -72,6 +83,8 @@ class KeyRing {
   };
   std::unordered_map<uint32_t, SwitchKeys> switches_;
   mutable std::unordered_map<uint32_t, HopKey> hop_cache_;  // 单线程访问约定
+  uint64_t seed_ = 0;                                       // M5.21：保存种子
+  mutable std::unordered_map<uint32_t, uint64_t> hkey_cache_;
 };
 
 // ---------------------------------------------------------------- 公开哈希
@@ -92,6 +105,14 @@ uint64_t contribution(const KeyRing& kr, const Hop& h, uint64_t hh);
 Header ingress(const KeyRing& kr, const Hop& h, uint8_t tag, uint64_t nonce);
 Header advance(const KeyRing& kr, const Hop& h, const Header& hdr, uint32_t pos);
 Header forward(const KeyRing& kr, const Path& path, uint8_t tag, uint64_t nonce);
+
+// MPV-2.1 数据面（M5.21）：每跳用自己的 h'_i = kr.h21(h.sid, nonce)。
+// 头格式与 2.0 完全相同（16B），两模式的帧不可从外观区分。
+Header ingress21(const KeyRing& kr, const Hop& h, uint8_t tag, uint64_t nonce);
+Header advance21(const KeyRing& kr, const Hop& h, const Header& hdr,
+                 uint32_t pos);
+Header forward21(const KeyRing& kr, const Path& path, uint8_t tag,
+                 uint64_t nonce);
 
 // ---------------------------------------------------------------- 控制面
 struct Expectation {
@@ -127,9 +148,18 @@ class ExpectationTable {
   // 流级 scan：tag 不可信时退化为遍历候选集，O(k)
   Verdict verify_flow_scan(uint64_t n, uint64_t sum_h, uint64_t sum_v) const;
 
+  // ---------------- MPV-2.1（M5.21）：逐包高保证模式 ----------------
+  // 每跳 h'_i = hp[sid]（由 KeyRing::prime_h21 预计算）。验证为逐跳重算
+  // O(h)（tag）/ O(k·h)（scan），mulmod 级开销；CFMV 在 2.1 下不可用
+  // （报告 §21.2 的结构性取舍）。伪造需全部前缀跳密钥。
+  Verdict verify_tag21(const Header& hdr, const uint64_t* hp) const;
+  Verdict verify_scan21(const Header& hdr, const uint64_t* hp) const;
+
  private:
+  const KeyRing kr_;
   std::vector<Path> paths_;
   std::vector<Expectation> table_;
+  uint64_t expect21(size_t path_idx, const uint64_t* hp) const;
 };
 
 // ---------------------------------------------------------------- CFMV 聚合

@@ -26,7 +26,8 @@
 // 用法：
 //     vswitch --sid 1 --seed 20260501 --table s1.tbl --report rep.txt
 //             --paths 2 --force-tag 0 --port 1:s1p1 --port 2:s1p2
-//             [--trace trace.txt] [--flow-window 32] [--evil bitflip]
+//             [--trace trace.txt] [--flow-window 32] [--scheme 20|21]
+//             [--evil bitflip]
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
@@ -57,6 +58,7 @@ namespace {
 
 constexpr uint16_t kShimEther = 0x88B5;
 constexpr uint16_t kIpEther = 0x0800;
+constexpr uint16_t kIpEther6 = 0x86DD;  // F6（M5.21）：IPv6 透传（验证与载荷无关）
 
 // ---------------------------------------------------------------- 内核加速（M5.17）
 // 1) TPACKET_V3 RX ring：内核把收到的帧直接写进 mmap 共享环，用户态处理完
@@ -172,9 +174,10 @@ class VSwitch {
  public:
   VSwitch(uint32_t sid, uint64_t seed, std::string table, std::string report,
           std::vector<Port> ports, int paths, int force_tag, Evil evil,
-          std::string trace_path, uint32_t flow_window)
+          std::string trace_path, uint32_t flow_window, bool scheme21)
       : kr_(KeyRing::generate(kMaxSwitches, kMaxPorts, seed)),
         sid_(sid),
+        scheme21_(scheme21),
         table_path_(std::move(table)),
         report_path_(std::move(report)),
         ports_(std::move(ports)),
@@ -209,6 +212,56 @@ class VSwitch {
     return pos_1based >= 1 && pos_1based <= (uint32_t)RHO_POW_N
                ? rho_[pos_1based - 1]
                : powmod(RHO, pos_1based - 1);
+  }
+
+  // E1（M5.21）：TX 批量 arena——handle() 只入队，drain 批末一次 sendmmsg。
+  // 定长 arena 保持每包零堆分配；arena 槽 2048B（MTU 1500 场景足够）。
+  static constexpr int kTxMax = 64;
+  struct TxMsg {
+    int fd;
+    size_t len;
+    sockaddr_ll addr;
+  };
+  TxMsg tx_[kTxMax];
+  uint8_t tx_buf_[kTxMax][2048];
+  int tx_n_ = 0;
+
+  void flush_tx() {
+    if (tx_n_ == 0) return;
+    int seen_fd[16];
+    int seen_n = 0;
+    for (int i = 0; i < tx_n_; ++i) {
+      bool found = false;
+      for (int j = 0; j < seen_n; ++j)
+        if (seen_fd[j] == tx_[i].fd) {
+          found = true;
+          break;
+        }
+      if (!found && seen_n < 16) seen_fd[seen_n++] = tx_[i].fd;
+    }
+    for (int j = 0; j < seen_n; ++j) {
+      struct mmsghdr m[kTxMax];
+      struct iovec iov[kTxMax];
+      int n = 0;
+      for (int i = 0; i < tx_n_; ++i) {
+        if (tx_[i].fd != seen_fd[j]) continue;
+        memset(&m[n], 0, sizeof(m[n]));
+        iov[n].iov_base = tx_buf_[i];
+        iov[n].iov_len = tx_[i].len;
+        m[n].msg_hdr.msg_iov = &iov[n];
+        m[n].msg_hdr.msg_iovlen = 1;
+        m[n].msg_hdr.msg_name = &tx_[i].addr;
+        m[n].msg_hdr.msg_namelen = sizeof(tx_[i].addr);
+        ++n;
+      }
+      int sent = ::sendmmsg(seen_fd[j], m, (unsigned)n, 0);
+      if (sent < 0)
+        std::fprintf(stderr, "[s%u] sendmmsg 失败: %s\n", sid_,
+                     std::strerror(errno));
+      else if (sent < n)
+        std::fprintf(stderr, "[s%u] sendmmsg 部分发送 %d/%d\n", sid_, sent, n);
+    }
+    tx_n_ = 0;
   }
 
   void stats() const {
@@ -258,6 +311,7 @@ class VSwitch {
       }
       if (++last_check % 2 == 0) load_table(false);  // 约每 400ms 检查一次
     }
+    flush_tx();  // M5.21/E1：退出前冲掉未满批的 TX
   }
 
  private:
@@ -317,6 +371,7 @@ class VSwitch {
       }
       if (n < kBatch) break;
     }
+    flush_tx();
   }
 
   // TPACKET_V3：消费环内所有 USER 块。syscall 只发生在 poll 唤醒与状态
@@ -349,6 +404,7 @@ class VSwitch {
       // 块内帧全部处理完毕，归还内核
       bdesc->hdr.bh1.block_status = TP_STATUS_KERNEL;
     }
+    flush_tx();
   }
 
   void handle(const uint8_t* frame, size_t len, int in_idx) {
@@ -371,7 +427,7 @@ class VSwitch {
       payload = frame + 14 + HEADER_BYTES;
       payload_len = len - 14 - HEADER_BYTES;
       shimmed = true;
-    } else if (ether == kIpEther) {
+    } else if (ether == kIpEther || ether == kIpEther6) {
       payload = frame + 14;
       payload_len = len - 14;
     } else {
@@ -403,11 +459,14 @@ class VSwitch {
 
     if (!shimmed) {
       nonce = fresh_nonce();
-      Header h = ingress(kr_, hop, tag, nonce);
+      Header h = scheme21_ ? ingress21(kr_, hop, tag, nonce)
+                           : ingress(kr_, hop, tag, nonce);
       acc = h.acc;
     } else {
-      uint64_t c = contribution(kr_, hop, h_of(nonce));
-      acc = addmod(acc, mulmod(c, rho_pow(e->pos)));
+      // M5.21：2.0 用公开 h = h_of(nonce)（人人可算——观测回归攻击面）；
+      //        2.1 用每跳独立 h' = kr_.h21(sid_, nonce)（未处理 nonce 不可求值）
+      uint64_t hh = scheme21_ ? kr_.h21(sid_, nonce) : h_of(nonce);
+      acc = addmod(acc, mulmod(contribution(kr_, hop, hh), rho_pow(e->pos)));
     }
 
     // 恶意交换机：篡改验证头（在本跳的合法贡献之后叠加比特翻转）
@@ -418,7 +477,13 @@ class VSwitch {
 
     uint8_t out[65536];
     std::memcpy(out, frame, 12);
-    uint16_t et = e->strip ? kIpEther : kShimEther;
+    // M5.21/F6：剥离时按载荷 IP 版本恢复 ethertype（v4→0x0800、v6→0x86DD）。
+    // 此前写死 0x0800——IPv6 载荷被还原成畸形帧，两端内核丢弃（R8 根因）。
+    uint16_t et = kIpEther;
+    if (!e->strip)
+      et = kShimEther;
+    else if (payload_len > 0 && (payload[0] >> 4) == 6)
+      et = kIpEther6;
     out[12] = (uint8_t)(et >> 8);
     out[13] = (uint8_t)(et & 0xff);
     size_t off = 14;
@@ -433,18 +498,30 @@ class VSwitch {
     dst_addr.sll_ifindex = ifindex_by_port_[e->port];
     dst_addr.sll_halen = 6;
     std::memcpy(dst_addr.sll_addr, out, 6);
-    ssize_t sent = ::sendto(out_fd, out, off + payload_len, 0,
-                            reinterpret_cast<sockaddr*>(&dst_addr),
-                            sizeof(dst_addr));
-    if (sent > 0)
-      ++out_;
-    else
-      std::fprintf(stderr, "[s%u] sendto 失败: %s\n", sid_, std::strerror(errno));
+
+    // E1（M5.21）：TX 批量聚合——帧先进定长 arena，drain 批末 sendmmsg 一次
+    // 发出（此前每帧一次 sendto）。批内聚合不增加端到端延迟（同一次 drain）。
+    if (off + payload_len > sizeof(tx_buf_[0])) {
+      ++drop_;
+      return;  // 超 arena 单帧直接丢弃（MTU 1500 场景不会发生）
+    }
+    if (tx_n_ >= kTxMax) flush_tx();
+    std::memcpy(tx_buf_[tx_n_], out, off + payload_len);
+    tx_[tx_n_].fd = out_fd;
+    tx_[tx_n_].len = off + payload_len;
+    tx_[tx_n_].addr = dst_addr;
+    ++tx_n_;
+    ++out_;
 
     // 恶意交换机：重放（把带验证头的帧原样再发一份）
-    if (evil_ == Evil::kDup && shimmed && sent > 0)
-      ::sendto(out_fd, out, off + payload_len, 0,
-               reinterpret_cast<sockaddr*>(&dst_addr), sizeof(dst_addr));
+    if (evil_ == Evil::kDup && shimmed) {
+      if (tx_n_ >= kTxMax) flush_tx();
+      std::memcpy(tx_buf_[tx_n_], out, off + payload_len);
+      tx_[tx_n_].fd = out_fd;
+      tx_[tx_n_].len = off + payload_len;
+      tx_[tx_n_].addr = dst_addr;
+      ++tx_n_;
+    }
 
     // 逐跳取证：记录本跳之后实际写进帧里的累加值（flush 由 run() 轮次末统一做）
     if (trace_) {
@@ -464,6 +541,8 @@ class VSwitch {
                    (unsigned long long)nonce, (unsigned long long)acc, db);
       dirty_ = true;
       // CFMV：按 (流, tag) 聚合，凑满一个窗口上报一行
+      //（M5.21：仅 2.0 模式——2.1 逐跳 h' 破坏线性恒等式，报告 §21.2）
+      if (scheme21_) return;
       FlowAgg& a = flows_[entry_key(dk, tag)];
       a.add(nonce, acc);
       if (a.n >= flow_window_) {
@@ -477,6 +556,7 @@ class VSwitch {
 
   KeyRing kr_;
   uint32_t sid_;
+  bool scheme21_ = false;  // M5.21：MPV-2.1 逐包高保证模式（--scheme 21）
   std::string table_path_;
   std::string report_path_;
   std::vector<Port> ports_;
@@ -552,7 +632,7 @@ int main(int argc, char** argv) {
   uint32_t sid = 0;
   uint64_t seed = 0;
   bool debug = false;
-  std::string table, report, trace, evil = "none";
+  std::string table, report, trace, evil = "none", scheme = "20";
   int paths = 1, force_tag = -1;
   uint32_t flow_window = 32;
   std::vector<Port> ports;
@@ -568,6 +648,7 @@ int main(int argc, char** argv) {
     else if (a == "--paths") paths = std::stoi(next());
     else if (a == "--force-tag") force_tag = std::stoi(next());
     else if (a == "--flow-window") flow_window = (uint32_t)std::stoul(next());
+    else if (a == "--scheme") scheme = next();
     else if (a == "--evil") evil = next();
     else if (a == "--debug") debug = true;
     else if (a == "--port") {
@@ -584,6 +665,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "至少需要一个 --port\n");
     return 1;
   }
+  if (scheme != "20" && scheme != "21") {
+    std::fprintf(stderr, "未知 --scheme：%s（20|21，21 为逐包高保证模式）\n", scheme.c_str());
+    return 2;
+  }
   Evil emode = Evil::kNone;
   if (evil == "bitflip") emode = Evil::kBitflip;
   else if (evil == "dup") emode = Evil::kDup;
@@ -593,7 +678,7 @@ int main(int argc, char** argv) {
   }
 
   VSwitch sw(sid, seed, table, report, std::move(ports), paths, force_tag,
-             emode, trace, flow_window);
+             emode, trace, flow_window, scheme == "21");
   sw.set_debug(debug);
   g_sw = &sw;
   std::signal(SIGTERM, on_term);

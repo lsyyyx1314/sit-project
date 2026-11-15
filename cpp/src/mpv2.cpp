@@ -88,6 +88,7 @@ uint64_t powmod(uint64_t base, uint64_t exp) {
 KeyRing KeyRing::generate(uint32_t n_switches, uint32_t ports_per_switch,
                           uint64_t seed) {
   KeyRing kr;
+  kr.seed_ = seed;
   for (uint32_t sid = 1; sid <= n_switches; ++sid) {
     SwitchKeys sk;
     sk.key = derive(seed, "switch:" + std::to_string(sid));
@@ -96,6 +97,36 @@ KeyRing KeyRing::generate(uint32_t n_switches, uint32_t ports_per_switch,
     kr.switches_[sid] = std::move(sk);
   }
   return kr;
+}
+
+uint64_t KeyRing::switch_hkey(uint32_t sid) const {
+  auto it = hkey_cache_.find(sid);
+  if (it != hkey_cache_.end()) return it->second;
+  uint64_t k = derive(seed_, "mpv21:h:" + std::to_string(sid));
+  hkey_cache_.emplace(sid, k);
+  return k;
+}
+
+// MPV-2.1 的 h'：带密钥 BLAKE2b（RFC 7693 key 模式），密钥 = 每交换机独立
+// 派生的 k'_sid。与 2.0 的 h_of（无密钥、人人可算）本质区别：只有持有
+// k'_sid 的交换机能对 nonce 求值 h'——对"未处理过的 nonce"无法求值，
+// 观测回归攻击（报告 §21.1）由此被阻断。
+uint64_t KeyRing::h21(uint32_t sid, uint64_t nonce) const {
+  uint64_t k = switch_hkey(sid);
+  uint8_t kb[32];
+  put_u64_be32(kb, k);
+  uint8_t buf[6 + 7];
+  memcpy(buf, "mpv21-h", 6);
+  put_u56_be(buf + 6, nonce);
+  uint8_t out[8];
+  blake2b(out, 8, buf, 13, kb, 32);
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | out[i];
+  return v % P;
+}
+
+void KeyRing::prime_h21(uint64_t nonce, uint64_t* out) const {
+  for (uint32_t s = 0; s <= kMaxSwitches; ++s) out[s] = s ? h21(s, nonce) : 0;
 }
 
 uint64_t KeyRing::port_key(const Hop& h) const {
@@ -170,6 +201,31 @@ Header forward(const KeyRing& kr, const Path& path, uint8_t tag, uint64_t nonce)
   return hdr;
 }
 
+// ------------------------------------------------------------- MPV-2.1 数据面
+Header ingress21(const KeyRing& kr, const Hop& h, uint8_t tag, uint64_t nonce) {
+  Header hdr{};
+  hdr.nonce = nonce;
+  hdr.tag = tag;
+  hdr.acc = contribution(kr, h, kr.h21(h.sid, nonce));  // ρ^0 = 1
+  return hdr;
+}
+
+Header advance21(const KeyRing& kr, const Hop& h, const Header& hdr,
+                 uint32_t pos) {
+  uint64_t c = contribution(kr, h, kr.h21(h.sid, hdr.nonce));
+  Header out = hdr;
+  out.acc = addmod(hdr.acc, mulmod(c, powmod(RHO, pos - 1)));
+  return out;
+}
+
+Header forward21(const KeyRing& kr, const Path& path, uint8_t tag,
+                 uint64_t nonce) {
+  Header hdr = ingress21(kr, path.front(), tag, nonce);
+  for (size_t i = 1; i < path.size(); ++i)
+    hdr = advance21(kr, path[i], hdr, static_cast<uint32_t>(i + 1));
+  return hdr;
+}
+
 // ---------------------------------------------------------------- 控制面
 Expectation expectation(const KeyRing& kr, const Path& path) {
   uint64_t A = 0, B = 0, w = 1;
@@ -184,7 +240,7 @@ Expectation expectation(const KeyRing& kr, const Path& path) {
 
 ExpectationTable::ExpectationTable(const KeyRing& kr,
                                    const std::vector<Path>& paths)
-    : paths_(paths) {
+    : kr_(kr), paths_(paths) {
   table_.reserve(paths.size());
   for (const Path& p : paths) table_.push_back(expectation(kr, p));
 }
@@ -247,6 +303,47 @@ Verdict ExpectationTable::verify_flow_scan(uint64_t n, uint64_t sum_h,
     const Expectation& e = table_[i];
     uint64_t lhs = addmod(mulmod(n % P, e.A), mulmod(e.B, sum_h));
     if (lhs == sum_v) {
+      v.ok = true;
+      v.matched = static_cast<int>(i);
+      return v;
+    }
+  }
+  return v;
+}
+
+// ------------------------------------------------------------- MPV-2.1 验证
+// 逐跳重算期望：V = Σ (a_i + b_i·h'_i)·ρ^(i-1)，h'_i = hp[sid] 已由
+// KeyRing::prime_h21 预计算（每包一次，tag21/scan21 复用）。无 (A,B) 仿射
+// 结构 → 观测回归攻击失效（报告 §21）。
+uint64_t ExpectationTable::expect21(size_t idx, const uint64_t* hp) const {
+  const Path& p = paths_[idx];
+  uint64_t V = 0, w = 1;
+  for (const Hop& h : p) {
+    HopKey k = kr_.hop_key(h);
+    V = addmod(V, mulmod(addmod(k.a, mulmod(k.b, hp[h.sid])), w));
+    w = mulmod(w, RHO);
+  }
+  return V;
+}
+
+Verdict ExpectationTable::verify_tag21(const Header& hdr,
+                                       const uint64_t* hp) const {
+  Verdict v;
+  if (hdr.tag >= table_.size()) return v;
+  v.checks = 1;
+  if (expect21(hdr.tag, hp) == hdr.acc) {
+    v.ok = true;
+    v.matched = hdr.tag;
+  }
+  return v;
+}
+
+Verdict ExpectationTable::verify_scan21(const Header& hdr,
+                                        const uint64_t* hp) const {
+  Verdict v;
+  for (size_t i = 0; i < table_.size(); ++i) {
+    v.checks = static_cast<int>(i + 1);
+    if (expect21(i, hp) == hdr.acc) {
       v.ok = true;
       v.matched = static_cast<int>(i);
       return v;

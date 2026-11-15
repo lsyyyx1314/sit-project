@@ -58,19 +58,23 @@ std::vector<Direction> load_cand(const std::string& file) {
 int main(int argc, char** argv) {
   std::string cand, report;
   uint64_t seed = 0;
+  bool scheme21 = false;
+  size_t window = 1 << 16;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--cand") cand = argv[++i];
     else if (a == "--report") report = argv[++i];
     else if (a == "--seed") seed = std::stoull(argv[++i]);
+    else if (a == "--scheme") scheme21 = std::string(argv[++i]) == "21";
+    else if (a == "--window") window = std::stoull(argv[++i]);
   }
   if (cand.empty() || report.empty()) {
-    std::fprintf(stderr, "用法: verify_reports --cand c.txt --report r.txt --seed S\n");
+    std::fprintf(stderr, "用法: verify_reports --cand c.txt --report r.txt --seed S [--scheme 20|21] [--window N]\n");
     return 2;
   }
 
   std::vector<Direction> dirs = load_cand(cand);
-  Controller ctl(seed, dirs);
+  Controller ctl(seed, dirs, 1 << 14, scheme21, window);
 
   std::ifstream in(report);
   std::string line;

@@ -1,6 +1,7 @@
 #include "topo.h"
 
 #include <signal.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -46,6 +47,25 @@ void veth(const std::string& host, const std::string& sw, const std::string& ns)
 std::string workdir() {
   const char* e = ::getenv("MPV_WORK");
   return (e && *e) ? std::string(e) : "/tmp/mpv_run";
+}
+
+uint64_t resolve_seed() {
+  static uint64_t cached = 0;
+  static bool ready = false;
+  if (ready) return cached;
+  const char* e = ::getenv("MPV_SEED");
+  if (e && *e) {
+    cached = std::strtoull(e, nullptr, 0);
+  } else {
+    while (::getrandom(&cached, sizeof(cached), 0) != (ssize_t)sizeof(cached)) {
+      if (errno != EINTR) {
+        std::perror("getrandom");
+        std::_Exit(2);
+      }
+    }
+  }
+  ready = true;
+  return cached;
 }
 
 std::string ns_prefix() {
@@ -94,9 +114,11 @@ void setup_links() {
   // 注：曾试验 net.core.busy_poll/busy_read=50 配合 SO_BUSY_POLL（M5.17），
   // 实测 CPU 大增而墙钟无益（veth 对端唤醒不受本端忙等影响），已回退。
   for (const char* base : {"h1", "h2"}) must("ip netns add " + nsname(base));
+  // F6（M5.21）：保留 IPv6 并配置 ULA 地址（此前为避免 v6 噪声直接禁用）；
+  // 关闭 DAD 避免首批 ping6 的邻居探测延迟
   for (const char* base : {"h1", "h2"})
     sh(std::string("ip netns exec ") + nsname(base) +
-       " sysctl -qw net.ipv6.conf.all.disable_ipv6=1");
+       " sysctl -qw net.ipv6.conf.all.accept_dad=0");
 
   veth("h1e", "s1p1", nsname("h1"));
   veth("s1p2", "s2p1", "");
@@ -109,6 +131,12 @@ void setup_links() {
        " ip link set h1e address " + H1MAC);
   must(std::string("ip netns exec ") + nsname("h2") +
        " ip link set h2e address " + H2MAC);
+  // F6（M5.21）：DAD 修复——all 层 accept_dad 对新建接口不生效（继承默认
+  // accept_dad=1），地址会经历 tentative 期，此间内核丢弃发往该地址的包
+  // （R8 反向 0 回复的根因）。改为接口创建后、加地址前按接口关闭 DAD。
+  for (const char* base : {"h1", "h2"})
+    must(std::string("ip netns exec ") + nsname(base) + " sysctl -qw net.ipv6.conf." +
+         (base == std::string("h1") ? "h1e" : "h2e") + ".accept_dad=0");
   must(std::string("ip netns exec ") + nsname("h1") +
        " ip addr add 10.0.0.1/24 dev h1e");
   must(std::string("ip netns exec ") + nsname("h2") +
@@ -119,6 +147,15 @@ void setup_links() {
        " ip neigh replace 10.0.0.2 lladdr " + H2MAC + " dev h1e");
   must(std::string("ip netns exec ") + nsname("h2") +
        " ip neigh replace 10.0.0.1 lladdr " + H1MAC + " dev h2e");
+  // F6：IPv6 ULA 地址 + 静态邻居（验证数据面与载荷协议无关）
+  must(std::string("ip netns exec ") + nsname("h1") +
+       " ip -6 addr add fd00:1::1/64 dev h1e");
+  must(std::string("ip netns exec ") + nsname("h2") +
+       " ip -6 addr add fd00:1::2/64 dev h2e");
+  must(std::string("ip netns exec ") + nsname("h1") +
+       " ip -6 neigh replace fd00:1::2 lladdr " + H2MAC + " dev h1e");
+  must(std::string("ip netns exec ") + nsname("h2") +
+       " ip -6 neigh replace fd00:1::1 lladdr " + H1MAC + " dev h2e");
 }
 
 void write_tables(Scenario sc) {
@@ -189,7 +226,11 @@ pid_t spawn_switch(const std::string& vswitch_bin, const SwitchConf& conf) {
   a.push_back("--sid");
   a.push_back(std::to_string(conf.sid));
   a.push_back("--seed");
-  a.push_back(std::to_string(SEED));
+  a.push_back(std::to_string(conf.seed ? conf.seed : resolve_seed()));
+  if (conf.scheme != "20") {
+    a.push_back("--scheme");
+    a.push_back(conf.scheme);
+  }
   a.push_back("--table");
   a.push_back(table_path(conf.sid));
   a.push_back("--report");
@@ -233,6 +274,11 @@ void stop_switch(pid_t pid) {
 void run_traffic(int count, const std::string& interval) {
   sh("ip netns exec " + nsname("h1") + " ping -c " + std::to_string(count) +
      " -i " + interval + " -W 1 10.0.0.2 >/dev/null");
+}
+
+void run_traffic6(int count, const std::string& interval) {
+  sh("ip netns exec " + nsname("h1") + " ping -6 -c " + std::to_string(count) +
+     " -i " + interval + " -W 1 fd00:1::2 >/dev/null");
 }
 
 std::vector<mpv::Path> cand_fwd() {
