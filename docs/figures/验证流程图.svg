@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="600" viewBox="0 0 920 600" font-family="'Microsoft YaHei','PingFang SC',sans-serif">
+  <defs>
+    <marker id="a2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="920" height="600" fill="#f8fafc"/>
+  <text x="460" y="30" text-anchor="middle" font-size="18" font-weight="700" fill="#1e293b">MPV-2 验证流程 · 数据面逐跳累积 → 控制面判定与定位</text>
+
+  <!-- 数据面泳道 -->
+  <rect x="30" y="55" width="860" height="240" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="50" y="80" font-size="14" font-weight="700" fill="#1d4ed8">数据平面</text>
+
+  <rect x="55" y="100" width="180" height="66" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="145" y="122" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">入口交换机</text>
+  <text x="145" y="140" text-anchor="middle" font-size="10.5" fill="#475569">生成 56bit 随机 nonce</text>
+  <text x="145" y="156" text-anchor="middle" font-size="10.5" fill="#475569">V ← c₁ = (a₁+b₁·h) mod p</text>
+
+  <rect x="285" y="100" width="180" height="66" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="375" y="122" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">中间交换机（逐跳）</text>
+  <text x="375" y="140" text-anchor="middle" font-size="10.5" fill="#475569">V ← V + cᵢ·ρ^(i−1)</text>
+  <text x="375" y="156" text-anchor="middle" font-size="10.5" fill="#475569">位置权重绑定顺序；写 TRACE</text>
+
+  <rect x="515" y="100" width="180" height="66" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="605" y="122" text-anchor="middle" font-size="12" font-weight="600" fill="#1e3a8a">出口交换机</text>
+  <text x="605" y="140" text-anchor="middle" font-size="10.5" fill="#475569">剥离垫片，恢复 IP 帧</text>
+  <text x="605" y="156" text-anchor="middle" font-size="10.5" fill="#475569">按 (流,tag) 聚合 (N,Σh,ΣV)</text>
+
+  <rect x="730" y="100" width="140" height="66" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-dasharray="5 3"/>
+  <text x="800" y="122" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">恶意交换机（注入）</text>
+  <text x="800" y="140" text-anchor="middle" font-size="10.5" fill="#64748b">bitflip：翻转 1 比特</text>
+  <text x="800" y="156" text-anchor="middle" font-size="10.5" fill="#64748b">dup：重放整帧</text>
+
+  <line x1="235" y1="133" x2="285" y2="133" stroke="#475569" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="465" y1="133" x2="515" y2="133" stroke="#475569" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="695" y1="133" x2="730" y2="133" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#a2)"/>
+
+  <rect x="55" y="200" width="640" height="60" rx="8" fill="#ffffff" stroke="#94a3b8"/>
+  <text x="375" y="222" text-anchor="middle" font-size="11" fill="#334155">16B 验证头随帧转发：nonce(7B) ｜ V(8B) ｜ tag(1B)，长度不随跳数/路径数增长</text>
+  <text x="375" y="243" text-anchor="middle" font-size="10.5" fill="#64748b">h = H(nonce) 公开可算；cᵢ 由端口密钥 K(sid,in,out) 派生，攻击者改路径必改 V</text>
+
+  <!-- 上报箭头 -->
+  <line x1="605" y1="166" x2="605" y2="330" stroke="#d97706" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a2)"/>
+  <text x="615" y="300" font-size="11" fill="#b45309">上报 逐包 / FLOW / TRACE</text>
+
+  <!-- 控制面泳道 -->
+  <rect x="30" y="330" width="860" height="240" rx="10" fill="#fefce8" stroke="#ca8a04" stroke-width="1.5"/>
+  <text x="50" y="355" font-size="14" font-weight="700" fill="#a16207">控制平面</text>
+
+  <rect x="55" y="375" width="160" height="70" rx="8" fill="#ffffff" stroke="#ca8a04" stroke-width="1.2"/>
+  <text x="135" y="397" text-anchor="middle" font-size="12" font-weight="600" fill="#713f12">nonce 重放窗口</text>
+  <text x="135" y="415" text-anchor="middle" font-size="10.5" fill="#78716c">重复 nonce → 判重放</text>
+  <text x="135" y="432" text-anchor="middle" font-size="10.5" fill="#78716c">拦截后不再判定</text>
+
+  <rect x="255" y="375" width="200" height="70" rx="8" fill="#ffffff" stroke="#ca8a04" stroke-width="1.2"/>
+  <text x="355" y="397" text-anchor="middle" font-size="12" font-weight="600" fill="#713f12">判定（三模式）</text>
+  <text x="355" y="415" text-anchor="middle" font-size="10.5" fill="#78716c">CPMV：V == A_tag + B_tag·h</text>
+  <text x="355" y="432" text-anchor="middle" font-size="10.5" fill="#78716c">BPMV 兜底 scan；CFMV 流级</text>
+
+  <polygon points="520,375 640,375 660,410 640,445 520,445 500,410" fill="#ffffff" stroke="#ca8a04" stroke-width="1.2"/>
+  <text x="580" y="405" text-anchor="middle" font-size="12" font-weight="600" fill="#713f12">V == E(h, P_tag)？</text>
+  <text x="580" y="425" text-anchor="middle" font-size="10.5" fill="#78716c">（或流级恒等式成立？）</text>
+
+  <rect x="700" y="370" width="170" height="36" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="785" y="393" text-anchor="middle" font-size="12" font-weight="600" fill="#166534">通过：计入正常流</text>
+  <rect x="700" y="418" width="170" height="36" rx="8" fill="#fee2e2" stroke="#dc2626" stroke-width="1.2"/>
+  <text x="785" y="441" text-anchor="middle" font-size="12" font-weight="600" fill="#991b1b">失败：进入定位</text>
+
+  <line x1="215" y1="410" x2="255" y2="410" stroke="#475569" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="455" y1="410" x2="500" y2="410" stroke="#475569" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="660" y1="400" x2="700" y2="388" stroke="#16a34a" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="660" y1="422" x2="700" y2="436" stroke="#dc2626" stroke-width="2" marker-end="url(#a2)"/>
+
+  <rect x="55" y="475" width="440" height="75" rx="8" fill="#ffffff" stroke="#dc2626" stroke-width="1.2"/>
+  <text x="275" y="496" text-anchor="middle" font-size="12" font-weight="600" fill="#991b1b">多故障定位（逐跳取证对照）</text>
+  <text x="275" y="514" text-anchor="middle" font-size="10.5" fill="#78716c">① 位置偏离：实际 (sid,in,out) ≠ 声称第 i 跳 → 改道嫌疑</text>
+  <text x="275" y="531" text-anchor="middle" font-size="10.5" fill="#78716c">② 观测值偏离：V_after ≠ 上一跳观测值 + cᵢ·ρ^(i−1) → 篡改嫌疑</text>
+  <text x="275" y="545" text-anchor="middle" font-size="10.5" fill="#78716c">③ 黑洞：取证出现但出口未上报的 nonce → 失联，定位改道点</text>
+
+  <rect x="520" y="475" width="350" height="75" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="695" y="496" text-anchor="middle" font-size="12" font-weight="600" fill="#166534">故障切换协同</text>
+  <text x="695" y="514" text-anchor="middle" font-size="10.5" fill="#78716c">链路 down → 候选集收敛 {P1}，转发表热加载</text>
+  <text x="695" y="531" text-anchor="middle" font-size="10.5" fill="#78716c">流量绕行 P1，验证继续全通过（零误报）</text>
+  <text x="695" y="545" text-anchor="middle" font-size="10.5" fill="#78716c">nonce 窗口与期望表随场景重建</text>
+</svg>
