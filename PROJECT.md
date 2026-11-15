@@ -23,8 +23,9 @@
 ### 演示 APP
 
 ```bash
-sudo ./cpp/build/dashboard --port 8080   # VM 上运行
-# 浏览器打开 http://<VM地址>:8080
+sudo ./cpp/build/dashboard --port 8080 --bind 0.0.0.0   # 局域网浏览器访问
+# 浏览器打开 http://<VM地址>:8080（POST 接口需启动时打印的管理令牌；
+# 不加 --bind 默认仅本机 127.0.0.1 可达——安全默认，见 M5.19）
 ```
 
 浏览器实时拓扑动画 + 七个场景一键注入（正常 / 标签错配 / 黑洞偏离 / 恶意改头 / 恶意重放 /
@@ -83,6 +84,7 @@ VM 实测核心数字（完整数据见 `results/exp_report.md`）：
 | M5.16 | 线程池 tpool（固定线程 + 栈收紧 512KB + wait_idle，exp/dashboard 全程复用）+ 内存收尾：EventView 去字符串化（每事件 3 次堆分配→0）、/api/state 暴露实测 RSS（5.2MB）、exp [8] 附 VmHWM 13.7MB；池压测断言 716/716 | ✅ |
 | M5.17 | 内核加速受控实验：TPACKET_V3/QDISC_BYPASS/SO_BUSY_POLL 实现并逐一实测（socket 层对该负载全部无增益或有伤害，负结果矩阵入 §19）；新增 µs CPU/行度量；V3/BUSY_POLL/BYPASS 以 env 选择性启用默认关闭；e2e/tests 全过 | ✅ |
 | M5.18 | 优化空间分析（`docs/优化空间分析报告.md`）与落地：P0 安全加固——上报行边界校验（TRACE 越界 sid/端口、越界 tag 此前可单行击穿控制器，模糊测试发现并最小复现）、单 nonce 取证条目上界；FLOW/TRACE 手写解析（3.1×/5×）；`-O3 -flto`（scan ≈2.5×）+ Makefile 自动依赖；NonceWindow 分支回卷；断言 716→727（新增 11 项对抗），e2e R1–R7、ASan/UBSan、200 万次模糊测试全过 | ✅ |
+| M5.19 | 部署安全加固（Jupyter/Minikube 行业范式）：dashboard 默认回环绑定 + `--bind` 显式暴露；CSPRNG 管理令牌门禁全部 POST（X-MPV-Token 头 / HttpOnly+SameSite=Strict Cookie，UI 零改动，常数时间比较）；工作目录 0700 + vswitch/dashboard umask(077)（report/trace 落盘 0600）；MPV_NS 白名单防 shell 注入；新增 `include/webauth.h` 授权原语；断言 727→743（+16 项含 20000 次随机头块对抗）；VM 冒烟实测：无令牌/错误令牌/跨站伪造均 401，带令牌与浏览器 Cookie 全链路 200，外部暴露门禁生效 | ✅ |
 | M6 | 论文与结题 | 论文草稿就位（`docs/结题论文草稿-面向SDN的高效多路径验证.md`），实验数据齐备 |
 
 ---
@@ -222,7 +224,7 @@ make            # 编译 6 个可执行文件
 make test       # 黄金向量 + 功能/对抗/CFMV/定位断言
 make bench      # 攻击矩阵、多候选矩阵、性能与基线对比
 sudo make e2e   # 五轮端到端（需 root：netns + AF_PACKET）
-sudo make demo  # 演示 APP，浏览器打开 http://<VM地址>:8080
+sudo make demo  # 演示 APP（--bind 0.0.0.0 + 令牌门禁），浏览器打开 http://<VM地址>:8080
 ```
 
 端到端与演示共用 `topo.cpp` 编排：创建 `h1`/`h2` 两个网络命名空间与 6 条 veth，

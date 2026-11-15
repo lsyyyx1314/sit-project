@@ -548,6 +548,7 @@ void on_term(int) { g_stop = true; }
 }  // namespace
 
 int main(int argc, char** argv) {
+  ::umask(077);  // M5.19：report/trace 落盘即 0600（取证含逐跳累计值，默认不开放）
   uint32_t sid = 0;
   uint64_t seed = 0;
   bool debug = false;

@@ -20,6 +20,7 @@
 #include "mpv2.h"
 #include "controller.h"
 #include "tpool.h"
+#include "webauth.h"
 
 using namespace mpv;
 
@@ -539,6 +540,68 @@ static void controller_tests() {
                     (unsigned long long)bad.acc, MAC);
       ev = c7.feed(line);
       CHECK(!ev.ok && ev.suspect_sid == 2, "TRACE 手写解析定位仍精确");
+    }
+  }
+
+  // M5.19 部署加固：webauth 授权原语（常数时间比较 / 头提取 / 门禁判定）
+  {
+    const std::string tk = "0123456789abcdef0123456789abcdef";
+    CHECK(mpv::secure_equal(tk, tk), "secure_equal 相同令牌通过");
+    CHECK(!mpv::secure_equal(tk, "0123456789abcdef0123456789abcdeX"),
+          "secure_equal 末字节差异被拒");
+    CHECK(!mpv::secure_equal(tk, tk.substr(0, 31)),
+          "secure_equal 长度差异被拒");
+
+    auto head = [](const std::string& extra) {
+      return "POST /api/traffic HTTP/1.1\r\nHost: x\r\n" + extra + "\r\n\r\nbody";
+    };
+    {
+      std::string v;
+      CHECK(mpv::header_token(head("X-MPV-Token: " + tk + "\r\n"), &v) && v == tk,
+            "X-MPV-Token 头提取正确");
+      CHECK(mpv::write_authorized(head("X-MPV-Token: " + tk + "\r\n"), tk),
+            "X-MPV-Token 头授权通过");
+    }
+    CHECK(mpv::write_authorized(head("x-mpv-token:   " + tk + "  \r\n"), tk),
+          "头名大小写不敏感 + 值两侧空白容忍");
+    CHECK(mpv::write_authorized(head("Cookie: a=1; mpv_token=" + tk + "; b=2\r\n"), tk),
+          "Cookie 中的 mpv_token 授权通过（分号截断）");
+    CHECK(mpv::write_authorized(head("Cookie: mpv_token=" + tk + "\r\n"), tk),
+          "Cookie 末位无分号也通过");
+    // 对抗性绕过尝试：一律拒绝
+    CHECK(!mpv::write_authorized(head("X-MPV-Token: " + tk + "x\r\n"), tk),
+          "令牌尾部追加被拒");
+    CHECK(!mpv::write_authorized(head("X-MPV-Token: " + tk.substr(0, 31) + "\r\n"), tk),
+          "令牌截断被拒");
+    CHECK(!mpv::write_authorized(head("Cookie: mpv_tokenX=" + tk + "\r\n"), tk),
+          "伪造 mpv_tokenX 参数名被拒");
+    CHECK(!mpv::write_authorized(head("Cookie: Xmpv_token=" + tk + "\r\n"), tk),
+          "前缀拼接伪造被拒");
+    CHECK(!mpv::write_authorized(head("X-MPV-TOKENX: " + tk + "\r\n"), tk),
+          "相似头名被拒");
+    CHECK(!mpv::write_authorized(head(""), tk), "无任何凭据被拒");
+    CHECK(!mpv::write_authorized(head("X-MPV-Token: \r\n"), tk), "空令牌头被拒");
+    // 随机畸形头块 20000 次：除非恰含完整令牌头/Cookie，否则必须拒绝
+    {
+      unsigned s = 99;
+      auto rnd = [&s]() { s = s * 6364136223846793005ULL + 1442695040888963407ULL; return s; };
+      bool safe = true;
+      for (int i = 0; i < 20000 && safe; ++i) {
+        std::string h = "POST / HTTP/1.1\r\n";
+        int lines = (int)(rnd() % 5);
+        for (int l = 0; l < lines; ++l) {
+          const char* names[] = {"X-MPV-Token", "x-mpv-token", "X-MPV-TOKEN",
+                                 "Cookie", "cookie", "X-MPV-TokenX", "CookieX"};
+          // 生成器只产出"残缺凭据"：截断/追加垃圾/参数名伪造成分——任何组合
+          // 都不应授权。完整令牌的合法路径由上面的显式 CHECK 覆盖。
+          const std::string vals[] = {tk.substr(0, 31), tk + "x",
+                                      "mpv_token=" + tk.substr(0, 31),
+                                      "mpv_tokenX=" + tk, " "};
+          h += std::string(names[rnd() % 7]) + ": " + vals[rnd() % 5] + "\r\n";
+        }
+        if (mpv::write_authorized(h, tk)) safe = false;
+      }
+      CHECK(safe, "20000 次随机畸形头块（残缺凭据组合）无一绕过门禁");
     }
   }
 

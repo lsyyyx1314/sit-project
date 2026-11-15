@@ -27,6 +27,11 @@ constexpr uint64_t SEED = 20260501;
 std::string workdir();
 std::string ns_prefix();
 
+// 目录加固（M5.19）：确保工作目录存在并把权限收紧到 0700（多实例按 MPV_WORK
+// 隔离的每个目录各自生效）；目录内 report/trace 由 vswitch/dashboard 的
+// umask(077) 落成 0600——本机其他低权限用户不可读验证数据与取证文件。
+void harden_workdir();
+
 // 场景：normal 正常；tagflip 标签错配（s1 把 tag0 改走 P1 分支且全网自洽）；
 // blackhole 路径偏离（s1 把 tag0 改走 s3，s3 无 tag0 表项 → 丢包黑洞）；
 // failover 链路故障切换（s1–s2 链路 down，tag0 全网切到 P1 分支，

@@ -15,6 +15,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -37,6 +38,7 @@
 #include "controller.h"
 #include "tpool.h"
 #include "topo.h"
+#include "webauth.h"
 
 using namespace mpv;
 using namespace topo;
@@ -80,6 +82,36 @@ void blackhole_check();  // 定义在交换机管理之后
 // 黑洞检测 nonce 集合上界（与控制器取证表同动机：长跑演示防无界增长；
 // 满后丢弃最旧语义由 reset 场景切换兜底）
 constexpr size_t kNonceSetCap = 1u << 16;
+
+// ---------------------------------------------------------------- 管理令牌（M5.19）
+// 每次启动由内核 CSPRNG 生成 128-bit 十六进制令牌，打印到终端一次。
+// 状态变更接口（POST /api/scenario|traffic|reset）必须携带：
+//   * 浏览器：GET / 时经 Set-Cookie 下发 HttpOnly + SameSite=Strict Cookie，
+//     同源 fetch 自动携带（跨站请求不携带 → CSRF 免疫），UI 无需任何改动；
+//   * 脚本：curl -H "X-MPV-Token: <令牌>"。
+// 只读接口（GET /api/state）不设门禁——服务默认绑定回环地址，暴露需显式 --bind。
+std::string g_admin_token;  // main() 早期生成，此后只读（线程创建自带同步）
+
+std::string random_token_hex() {
+  unsigned char buf[16];
+  size_t got = 0;
+  while (got < sizeof(buf)) {
+    ssize_t n = ::getrandom(buf + got, sizeof(buf) - got, 0);
+    if (n <= 0) {
+      if (errno == EINTR) continue;
+      std::perror("getrandom");
+      std::_Exit(2);
+    }
+    got += (size_t)n;
+  }
+  static const char* hex = "0123456789abcdef";
+  std::string out(32, '0');
+  for (size_t i = 0; i < sizeof(buf); ++i) {
+    out[i * 2] = hex[buf[i] >> 4];
+    out[i * 2 + 1] = hex[buf[i] & 0xf];
+  }
+  return out;
+}
 
 // 后台跑一轮流量：ping 完成后视场景做黑洞定位
 void traffic_worker(int count) {
@@ -382,8 +414,16 @@ void serve(int fd) {
   std::string method, path, ver;
   ss >> method >> path >> ver;
 
+  // 状态变更门禁（M5.19）：所有 POST 必须携带管理令牌（X-MPV-Token 头或
+  // HttpOnly/SameSite=Strict 的 mpv_token Cookie），否则 401。
+  // 鉴权在分发前统一做，任何新增 POST 接口默认被覆盖。
+  std::string head = req.substr(0, body_start + 4);
   std::string resp;
-  if (method == "GET" && (path == "/" || path == "/index.html"))
+  if (method == "POST" && !mpv::write_authorized(head, g_admin_token)) {
+    std::fprintf(stderr, "[安全] 拒绝未授权 POST %s\n", path.c_str());
+    resp = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n"
+           "Content-Length: 0\r\n\r\n";
+  } else if (method == "GET" && (path == "/" || path == "/index.html"))
     resp = http_get(fd, "/");
   else if (method == "GET" && path == "/api/state")
     resp = http_get(fd, path);
@@ -795,8 +835,12 @@ std::string http_get(int, const std::string& path) {
            std::to_string(body.size()) + "\r\n\r\n" + body;
   }
   std::string page = kPage;
-  return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-         "Content-Length: " +
+  // 首页下发管理令牌 Cookie（M5.19）：HttpOnly（JS 不可读，防窃取）+
+  // SameSite=Strict（跨站请求不携带 → CSRF 免疫）+ 仅本站路径。
+  std::string cookie = "Set-Cookie: mpv_token=" + g_admin_token +
+                       "; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400\r\n";
+  return "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" +
+         cookie + "Content-Length: " +
          std::to_string(page.size()) + "\r\n\r\n" + page;
 }
 
@@ -813,16 +857,22 @@ void on_term_sig(int) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  ::umask(077);  // M5.19：本进程在 /tmp 写的日志/文件落盘即 0600
   if (::geteuid() != 0) {
     std::fprintf(stderr, "需要 root：sudo ./build/dashboard\n");
     return 2;
   }
   int port = 8080;
+  const char* bind_addr = "127.0.0.1";  // M5.19：默认仅本机可达（行业默认拒绝）
+  const char* token_arg = nullptr;      // --token <t>：固定令牌（脚本化接入用）
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--port") port = std::atoi(argv[++i]);
+    else if (a == "--bind") bind_addr = argv[++i];
+    else if (a == "--token") token_arg = argv[++i];
     else if (a == "--flow-window") g_flow_window = (uint32_t)std::atoi(argv[++i]);
   }
+  g_admin_token = token_arg ? std::string(token_arg) : random_token_hex();
 
   g_vswitch = [] {
     char buf[4096];
@@ -838,7 +888,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "找不到交换机程序: %s（先 make）\n", g_vswitch.c_str());
     return 2;
   }
-  ::mkdir(workdir().c_str(), 0755);
+  topo::harden_workdir();  // M5.19：工作目录 0700（report/trace 由 umask 落 0600）
 
   g_started = mono_s();
   setup_links();
@@ -854,7 +904,13 @@ int main(int argc, char** argv) {
   ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (::inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+    std::fprintf(stderr, "--bind 地址无效: %s（IPv4 点分十进制）\n", bind_addr);
+    stop_switches();
+    topo::cleanup();
+    delete g_ctl;
+    return 2;
+  }
   addr.sin_port = htons((uint16_t)port);
   if (::bind(srv, (sockaddr*)&addr, sizeof(addr)) != 0) {
     std::fprintf(stderr, "bind 失败（端口 %d 被占？）\n", port);
@@ -881,8 +937,16 @@ int main(int argc, char** argv) {
   std::thread t_tail(tailer_loop);
   t_tail.detach();
 
-  std::printf("MPV-2 演示控制台已启动：http://0.0.0.0:%d  （Ctrl-C 退出并清理拓扑）\n",
-              port);
+  std::printf("MPV-2 演示控制台已启动：http://%s:%d  （Ctrl-C 退出并清理拓扑）\n",
+              bind_addr, port);
+  std::printf("[安全] 管理令牌（POST 接口需要 X-MPV-Token 头或浏览器 Cookie）：\n"
+              "[安全]   %s\n"
+              "[安全] 浏览器无需输入：首次打开页面时已自动下发 Cookie。\n",
+              g_admin_token.c_str());
+  if (std::strcmp(bind_addr, "127.0.0.1") != 0)
+    std::printf("[安全] 警告：已绑定非回环地址 %s —— 本网络内任何主机都能看到页面；\n"
+                "[安全] 状态变更接口已要求令牌，只读接口（/api/state）公开。\n",
+                bind_addr);
   std::fflush(stdout);
 
   // 并发连接上限 + 线程池（M5.16）：服务线程固定预起、栈收紧 512KB，

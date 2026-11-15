@@ -1208,7 +1208,7 @@ int main(int argc, char** argv) {
   }
   ::mkdir("results", 0755);
   ::mkdir(g_chart_dir.c_str(), 0755);
-  ::mkdir(topo::workdir().c_str(), 0755);
+  topo::harden_workdir();  // M5.19：0700
   g_nthr = nthr > 0 ? nthr : (int)std::thread::hardware_concurrency();
   if (g_nthr <= 0) g_nthr = 2;
   if (g_nthr > 16) g_nthr = 16;

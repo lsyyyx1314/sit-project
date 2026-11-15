@@ -50,7 +50,26 @@ std::string workdir() {
 
 std::string ns_prefix() {
   const char* e = ::getenv("MPV_NS");
-  return (e && *e) ? std::string(e) : "";
+  std::string prefix = (e && *e) ? std::string(e) : "";
+  // 注入面收口（M5.19）：前缀会被拼进 sh() 的 shell 命令（ip netns exec 等）。
+  // 该变量属于操作员控制面，但仍按白名单校验——一旦有组件把环境变量透传给
+  // root 进程（Makefile / 包装脚本），畸形值就不再是"操作失误"而是提权点。
+  auto die = [](const char* why) {
+    std::fprintf(stderr, "[topo] 拒绝启动：%s\n", why);
+    std::_Exit(2);
+  };
+  if (prefix.size() > 32) die("MPV_NS 前缀超长（>32 字符）");
+  for (char c : prefix)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_'))
+      die("MPV_NS 前缀含非法字符（仅允许字母/数字/-/_）");
+  return prefix;
+}
+
+void harden_workdir() {
+  const std::string dir = workdir();
+  if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) return;
+  (void)::chmod(dir.c_str(), 0700);  // 收紧为仅属主可进（幂等）
 }
 
 // 全程使用带前缀的 ns 名，避免多实例互删对方的命名空间

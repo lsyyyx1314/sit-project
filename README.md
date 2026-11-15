@@ -15,7 +15,7 @@ make            # 编译 7 个可执行文件（cpp/build/）
 make test       # 黄金向量交叉校验 + 727 项功能/对抗/CFMV/重放/定位断言
 make bench      # 攻击矩阵、多候选矩阵、性能与基线对比
 sudo make e2e   # 七轮端到端：正常/标签错配/恶意改头/恶意重放/流级压缩/故障切换/多重故障
-sudo make demo  # 演示 APP：浏览器打开 http://<主机>:8080
+sudo make demo  # 演示 APP：--bind 0.0.0.0 供局域网浏览器访问；POST 需启动时打印的管理令牌
 sudo make exp   # 11 组实验一键运行，自动生成 results/exp_report.md + SVG 图表
 ```
 
@@ -45,6 +45,10 @@ E(P) = A_P + B_P·h               控制器期望值：与 nonce 无关，流建
 - nonce 窗口判重 O(1)（≈30 ns/次，分支回卷），抗重放
 - 上报行边界校验（M5.18）：越界 sid/端口/tag 的取证与上报行一律拒绝、单 nonce
   取证条目设上界——恶意交换机无法用伪造上报击穿控制器（模糊测试把关）
+- 部署加固（M5.19）：dashboard 默认仅绑定 127.0.0.1（`--bind` 显式暴露）；每次
+  启动生成 CSPRNG 管理令牌，POST 接口必须携带（浏览器经 HttpOnly +
+  SameSite=Strict Cookie 自动携带，UI 零改动；脚本用 X-MPV-Token 头）；常数
+  时间比较；工作目录 0700、report/trace 落盘 0600；MPV_NS 白名单防 shell 注入
 - 逐跳取证定位：首分歧 + 多故障全部嫌疑 + 黑洞失联发现
 - 链路故障切换时候选集与转发表协同收敛，验证零误报
 - 线程池复用、零堆分配热路径、RSS 实时可观测

@@ -51,7 +51,9 @@ e2e: all
 	sudo ./$(BUILD)/e2e
 
 demo: all
-	sudo ./$(BUILD)/dashboard --port 8080
+	sudo ./$(BUILD)/dashboard --port 8080 --bind 0.0.0.0
+	@echo "提示：POST 接口需启动时打印的管理令牌（X-MPV-Token 头）；"
+	@echo "      不加 --bind 则默认仅本机 127.0.0.1 可达（安全默认）。"
 
 exp: all
 	sudo ./$(BUILD)/exp
