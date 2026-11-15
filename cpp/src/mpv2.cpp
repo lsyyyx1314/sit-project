@@ -326,7 +326,8 @@ bool NonceWindow::see(uint64_t nonce) {
   impl_->ring[impl_->head] = nonce;
   impl_->next[impl_->head] = impl_->bucket[b];
   impl_->bucket[b] = (int32_t)impl_->head;
-  impl_->head = (impl_->head + 1) % cap_;
+  // 分支回卷替代 % cap_（热路径上每次判重插入省一次除法）
+  impl_->head = (impl_->head + 1 == cap_) ? 0 : impl_->head + 1;
   return true;
 }
 

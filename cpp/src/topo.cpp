@@ -15,7 +15,10 @@
 namespace topo {
 namespace {
 
-void sh(const std::string& cmd) { (void)std::system((cmd + " 2>/dev/null").c_str()); }
+void sh(const std::string& cmd) {
+  int rc = std::system((cmd + " 2>/dev/null").c_str());
+  (void)rc;  // 先存后弃：glibc 的 warn_unused_result 对 (void) 调用不生效
+}
 
 void must(const std::string& cmd) {
   if (std::system((cmd + " 2>/dev/null").c_str()) != 0)

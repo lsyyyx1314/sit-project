@@ -78,9 +78,11 @@ class Controller {
 
  private:
   int dir_of(const std::string& mac) const;
-  Event feed_packet(const std::string& line);  // 热路径：手写解析
-  Event feed_flow(std::istringstream& ss);
-  Event feed_trace(std::istringstream& ss);
+  // 三种行型全部手写解析（无 istringstream）：逐包行是热路径；FLOW/TRACE 行
+  // 此前走 istringstream（每行 2+ 次串拷贝，实测慢 1.6~1.9×），M5.18 同构改写。
+  Event feed_packet(const std::string& line);  // "<sid> <tag> <nonce> <acc> <mac>"
+  Event feed_flow(const char* p);    // "FLOW <mac> <tag> <N> <sum_h> <sum_v>"
+  Event feed_trace(const char* p);   // "TRACE <mac> <sid> <in> <out> <tag> <nonce> <pos> <V>"
 
   KeyRing kr_;
   std::vector<Direction> dirs_;

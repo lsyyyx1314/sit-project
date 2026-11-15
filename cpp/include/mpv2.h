@@ -26,6 +26,13 @@ constexpr int NONCE_BITS = 56;
 constexpr int TAG_BITS = 8;
 constexpr int HEADER_BYTES = 16; // 7 + 8 + 1
 
+// 部署边界：交换机台数与每台端口数（KeyRing::generate 的取值域，也是上报行
+// 字段校验的边界）。此前以魔数 (16, 4) 散布在 vswitch / controller 等处——
+// 控制器据此拒绝 sid/端口越界的取证行（越界行不可能来自合法交换机，
+// 放行会让 KeyRing::port_key 的 unordered_map::at 抛异常击穿控制器）。
+inline constexpr uint32_t kMaxSwitches = 16;
+inline constexpr uint32_t kMaxPorts = 4;
+
 struct Hop {
   uint32_t sid;
   uint32_t in_port;

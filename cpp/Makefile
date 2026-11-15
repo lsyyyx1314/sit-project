@@ -1,6 +1,11 @@
 # MPV-2 C++ 构建（无外部依赖，仅需 g++ >= 11 与 make）
+#
+# M5.18：-O3 -flto（跨 TU 内联折叠模运算与 blake2b 调用链，scan 判定实测 ≈2.6×）
+#        + -MMD -MP 自动头文件依赖（此前 HDRS 手工枚举，新增头文件会静默漏编）。
+#        正确性门槛：612 黄金向量逐位一致 + 全量断言 + e2e R1–R7（见 docs/优化空间分析报告.md）。
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
+CXXFLAGS ?= -std=c++17 -O3 -flto -Wall -Wextra -Iinclude
+CXXFLAGS += -MMD -MP
 
 BUILD := build
 SRC_CORE := src/blake2b.cpp src/mpv2.cpp src/tpool.cpp
@@ -53,3 +58,6 @@ exp: all
 
 clean:
 	rm -rf $(BUILD)
+
+# 自动生成的头文件依赖（-MMD -MP）：新增头文件改动可正确触发重编
+-include $(wildcard $(BUILD)/*.d)

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <sstream>
 
 namespace mpv {
 namespace {
@@ -15,11 +14,15 @@ double now_us() {
          1000.0;
 }
 
+// 单 nonce 取证条目上界：合法取证每 nonce ≤ 路径最长跳数（exp[11] 上界 32，
+// 取 64 有余量）。此前条目向量无界——同一 nonce 洪灌取证行可放大内存（P0-2）。
+constexpr size_t kTraceHopsMax = 64;
+
 }  // namespace
 
 Controller::Controller(uint64_t seed, const std::vector<Direction>& dirs,
                        size_t trace_cap)
-    : kr_(KeyRing::generate(16, 4, seed)),
+    : kr_(KeyRing::generate(kMaxSwitches, kMaxPorts, seed)),
       dirs_(dirs),
       trace_cap_(trace_cap ? trace_cap : 1) {
   tables_.reserve(dirs.size());
@@ -36,15 +39,11 @@ int Controller::dir_of(const std::string& mac) const {
 
 Event Controller::feed(const std::string& line) {
   if (line.empty()) return Event{};
-  // 快分发：前缀比较替代 istringstream 探头（每行两次流构造的开销）
-  if (line.size() >= 5 && line.compare(0, 5, "FLOW ") == 0) {
-    std::istringstream ss(line);
-    return feed_flow(ss);
-  }
-  if (line.size() >= 6 && line.compare(0, 6, "TRACE ") == 0) {
-    std::istringstream ss(line);
-    return feed_trace(ss);
-  }
+  // 快分发：前缀比较 + 手写解析（此前 FLOW/TRACE 行仍构造 istringstream）
+  if (line.size() >= 5 && line.compare(0, 5, "FLOW ") == 0)
+    return feed_flow(line.c_str());
+  if (line.size() >= 6 && line.compare(0, 6, "TRACE ") == 0)
+    return feed_trace(line.c_str());
   return feed_packet(line);
 }
 
@@ -140,17 +139,20 @@ Event Controller::feed_packet(const std::string& line) {
   return ev;
 }
 
-Event Controller::feed_flow(std::istringstream& ss) {
+// 手写解析热路径 "FLOW <mac> <tag> <N> <sum_h> <sum_v>"（十进制、空白分隔，
+// 与 vswitch 输出及旧 sscanf 行为一致：容忍制表符/多空格，字段缺失即失败）。
+// 此前走 istringstream + ss.str()：每行流构造 + 整行拷贝，实测 ~1.6× 于逐包快路径。
+Event Controller::feed_flow(const char* p) {
   Event ev;
+  p += 5;  // 跳过 "FLOW " 前缀（dispatch 已匹配）
   char mac[32];
-  unsigned tag;
-  unsigned long long n, sum_h, sum_v;
-  if (std::sscanf(ss.str().c_str(), "FLOW %31s %u %llu %llu %llu", mac, &tag,
-                  &n, &sum_h, &sum_v) != 5)
+  uint64_t tag, n, sum_h, sum_v;
+  if (!parse_mac(p, mac) || !parse_udec(p, tag) || !parse_udec(p, n) ||
+      !parse_udec(p, sum_h) || !parse_udec(p, sum_v))
     return ev;
   ev.kind = "flow";
   ev.mac = mac;
-  ev.tag = tag;
+  ev.tag = (uint32_t)tag;
   ev.n = n;
 
   int d = dir_of(mac);
@@ -178,19 +180,33 @@ Event Controller::feed_flow(std::istringstream& ss) {
   return ev;
 }
 
-Event Controller::feed_trace(std::istringstream& ss) {
+// 手写解析 "TRACE <mac> <sid> <in> <out> <tag> <nonce> <pos> <V_after>"
+// + 字段边界校验（M5.18 安全加固）：sid/端口超出部署边界（kMaxSwitches /
+// kMaxPorts）的取证行不可能来自合法交换机——直接丢弃。此前越界 Hop 会进入
+// 定位路径，在 KeyRing::port_key 的 unordered_map::at 处抛
+// std::out_of_range 击穿控制器：恶意交换机一行伪造取证 + 一个失败包（或
+// dashboard 黑洞路径）即可 DoS，且 dashboard 以 root 运行消费这些文件。
+// 取证表单 nonce 条目数同步加上界（kTraceHopsMax）。
+Event Controller::feed_trace(const char* p) {
   Event ev;
+  p += 6;  // 跳过 "TRACE " 前缀（dispatch 已匹配）
   char mac[32];
-  unsigned sid, in_p, out_p, tag, pos;
-  unsigned long long nonce, v_after;
-  if (std::sscanf(ss.str().c_str(), "TRACE %31s %u %u %u %u %llu %u %llu", mac,
-                  &sid, &in_p, &out_p, &tag, &nonce, &pos, &v_after) != 8)
+  uint64_t sid, in_p, out_p, tag, nonce, pos, v_after;
+  if (!parse_mac(p, mac) || !parse_udec(p, sid) || !parse_udec(p, in_p) ||
+      !parse_udec(p, out_p) || !parse_udec(p, tag) || !parse_udec(p, nonce) ||
+      !parse_udec(p, pos) || !parse_udec(p, v_after))
     return ev;
   int d = dir_of(mac);
   if (d < 0) return ev;  // 未知方向的取证无从对照，不入表
+  if (sid < 1 || sid > kMaxSwitches || in_p < 1 || in_p > kMaxPorts ||
+      out_p < 1 || out_p > kMaxPorts)
+    return ev;  // 越界行丢弃：定位退化为候选对比，功能不中断
   // 键 = 方向(8b) | nonce(56b)：nonce 空间 56 bit，方向数 < 256，无碰撞
   uint64_t key = ((uint64_t)d << 56) | (uint64_t)nonce;
-  traces_[key].push_back(HopTrace{sid, in_p, out_p, pos, v_after});
+  auto& recs = traces_[key];
+  if (recs.size() < kTraceHopsMax)
+    recs.push_back(HopTrace{(uint32_t)sid, (uint32_t)in_p, (uint32_t)out_p,
+                            (uint32_t)pos, v_after});
   // 内存上界：长期在线时取证按世代清空（旧取证的包退化为候选对比定位）
   if (traces_.size() > trace_cap_) traces_.clear();
   return ev;  // kind == ""，trace 不产生判定事件
@@ -212,6 +228,9 @@ std::vector<int> Controller::localize_all(size_t dir, uint8_t tag,
                                           uint64_t nonce, uint64_t acc) {
   std::vector<int> out;
   if (dir >= dirs_.size()) return out;
+  // tag 来自上报行（未信任输入，0~255）：越界 tag 无声称路径可对照，直接返回。
+  // 此前 paths[tag] 越界读是 UB——恶意出口交换机声称 tag=200 即可触发。
+  if (tag >= dirs_[dir].paths.size()) return out;
   const Path& claimed = dirs_[dir].paths[tag];
   // 键 = 方向(8b) | nonce(56b)，与 feed_trace 一致
   const uint64_t tkey = ((uint64_t)dir << 56) | (uint64_t)nonce;
