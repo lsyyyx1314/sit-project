@@ -85,6 +85,7 @@ VM 实测核心数字（完整数据见 `results/exp_report.md`）：
 | M5.17 | 内核加速受控实验：TPACKET_V3/QDISC_BYPASS/SO_BUSY_POLL 实现并逐一实测（socket 层对该负载全部无增益或有伤害，负结果矩阵入 §19）；新增 µs CPU/行度量；V3/BUSY_POLL/BYPASS 以 env 选择性启用默认关闭；e2e/tests 全过 | ✅ |
 | M5.18 | 优化空间分析（`docs/优化空间分析报告.md`）与落地：P0 安全加固——上报行边界校验（TRACE 越界 sid/端口、越界 tag 此前可单行击穿控制器，模糊测试发现并最小复现）、单 nonce 取证条目上界；FLOW/TRACE 手写解析（3.1×/5×）；`-O3 -flto`（scan ≈2.5×）+ Makefile 自动依赖；NonceWindow 分支回卷；断言 716→727（新增 11 项对抗），e2e R1–R7、ASan/UBSan、200 万次模糊测试全过 | ✅ |
 | M5.19 | 部署安全加固（Jupyter/Minikube 行业范式）：dashboard 默认回环绑定 + `--bind` 显式暴露；CSPRNG 管理令牌门禁全部 POST（X-MPV-Token 头 / HttpOnly+SameSite=Strict Cookie，UI 零改动，常数时间比较）；工作目录 0700 + vswitch/dashboard umask(077)（report/trace 落盘 0600）；MPV_NS 白名单防 shell 注入；新增 `include/webauth.h` 授权原语；断言 727→743（+16 项含 20000 次随机头块对抗）；VM 冒烟实测：无令牌/错误令牌/跨站伪造均 401，带令牌与浏览器 Cookie 全链路 200，外部暴露门禁生效 | ✅ |
+| M5.20 | 自研算法演进研究：发现并 PoC 证实**观测回归攻击**（2 个公开观测恢复 (A,B)，幽灵上报与 CFMV 窗口均被控制器接受——十类矩阵未覆盖的新攻击类，"1/p" 声明需按报告 §21 限定）；证明 CFMV 压缩与抗出口伪造不可兼得（定理级取舍）；提出并 PoC 验证 **MPV-2.1 融合方案**（每交换机独立 h-密钥，Wegman-Carter 化）：公开回归伪造与持自身密钥的恶意出口仿造均被拒，安全性归约到 PRF；工程路线（双模式/概率审计/128-bit）入报告 §21.4 | ✅（PoC 级；生产化见 §21.4） |
 | M6 | 论文与结题 | 论文草稿就位（`docs/结题论文草稿-面向SDN的高效多路径验证.md`），实验数据齐备 |
 
 ---
