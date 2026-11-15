@@ -173,7 +173,7 @@ class VSwitch {
   VSwitch(uint32_t sid, uint64_t seed, std::string table, std::string report,
           std::vector<Port> ports, int paths, int force_tag, Evil evil,
           std::string trace_path, uint32_t flow_window)
-      : kr_(KeyRing::generate(16, 4, seed)),
+      : kr_(KeyRing::generate(kMaxSwitches, kMaxPorts, seed)),
         sid_(sid),
         table_path_(std::move(table)),
         report_path_(std::move(report)),

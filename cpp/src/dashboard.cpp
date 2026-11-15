@@ -77,6 +77,10 @@ uint32_t g_flow_window = 10;
 std::atomic<bool> g_traffic_running{false};
 void blackhole_check();  // 定义在交换机管理之后
 
+// 黑洞检测 nonce 集合上界（与控制器取证表同动机：长跑演示防无界增长；
+// 满后丢弃最旧语义由 reset 场景切换兜底）
+constexpr size_t kNonceSetCap = 1u << 16;
+
 // 后台跑一轮流量：ping 完成后视场景做黑洞定位
 void traffic_worker(int count) {
   {
@@ -196,19 +200,23 @@ int dir_index(const std::string& mac) {
 
 void handle_line(const std::string& line) {
   // 黑洞检测的 nonce 集合（正向 h1→h2）：TRACE mac sid in out tag nonce pos v
+  // 边界校验与控制器 feed_trace 一致——越界行不可能是合法交换机发出的
   {
     unsigned a, b, c, d;
     unsigned long long nonce;
     char mac[32];
     if (std::sscanf(line.c_str(), "TRACE %31s %u %u %u %u %llu", mac, &a, &b, &c,
                     &d, &nonce) == 6 &&
-        std::strcmp(mac, H2MAC) == 0)
+        std::strcmp(mac, H2MAC) == 0 && a >= 1 && a <= kMaxSwitches &&
+        b >= 1 && b <= kMaxPorts && c >= 1 && c <= kMaxPorts &&
+        g_state.traced_h2.size() < kNonceSetCap)
       g_state.traced_h2.insert(nonce);
   }
   Event ev = g_ctl->feed(line);
   if (ev.kind.empty()) return;
 
-  if (ev.kind == "packet" && ev.mac == H2MAC)
+  if (ev.kind == "packet" && ev.mac == H2MAC &&
+      g_state.reported_h2.size() < kNonceSetCap)
     g_state.reported_h2.insert(ev.nonce);
 
   int d = dir_index(ev.mac);

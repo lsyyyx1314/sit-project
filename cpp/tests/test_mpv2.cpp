@@ -465,6 +465,83 @@ static void controller_tests() {
     CHECK(!evc.ok, "取证上界溢出后判定功能正常");
   }
 
+  // M5.18 安全加固：越界取证行必须被拒——旧实现无校验，越界 Hop 进入定位
+  // 路径后在 KeyRing::port_key 的 unordered_map::at 抛 std::out_of_range，
+  // 恶意交换机一行伪造 TRACE + 一个失败包即可击穿控制器（已最小复现）
+  {
+    Controller c4(SEED, dirs);
+    // sid 越界（部署 16 台）/ out_port 越界（部署 4 端口）/ in_port=0 / sid=17
+    c4.feed(std::string("TRACE ") + MAC + " 99 1 2 0 7001 1 12345");
+    c4.feed(std::string("TRACE ") + MAC + " 1 1 9 0 7002 1 12345");
+    c4.feed(std::string("TRACE ") + MAC + " 1 0 2 0 7003 1 12345");
+    c4.feed(std::string("TRACE ") + MAC + " 17 1 2 0 7004 1 12345");
+    std::snprintf(line, sizeof(line), "4 0 7001 1 %s", MAC);
+    ev = c4.feed(line);
+    CHECK(ev.kind == "packet" && !ev.ok, "越界取证行被丢弃，失败包仍正常判定");
+    CHECK(ev.suspects.empty(), "越界取证不进定位表（无崩溃、无伪造嫌疑）");
+    // 恶意 tag 越界（tag 来自上报行，0~255）：修复前 localize_all 的
+    // paths[tag] 越界读是 UB
+    std::snprintf(line, sizeof(line), "4 200 7005 1 %s", MAC);
+    ev = c4.feed(line);
+    CHECK(ev.kind == "packet" && !ev.ok && ev.suspects.empty(),
+          "越界 tag 不触发越界访问（无声称路径可对照）");
+    // 同 nonce 取证洪灌：单 nonce 条目上界生效，判定功能不受影响（P0-2）
+    for (int i = 0; i < 1000; ++i) {
+      char tl[160];
+      std::snprintf(tl, sizeof(tl), "TRACE %s 1 1 2 0 7777 1 %d", MAC, i);
+      c4.feed(tl);
+    }
+    std::snprintf(line, sizeof(line), "4 0 7777 1 %s", MAC);
+    ev = c4.feed(line);
+    CHECK(ev.kind == "packet" && !ev.ok,
+          "单 nonce 取证洪灌后判定功能正常（条目上界）");
+  }
+
+  // M5.18：FLOW/TRACE 手写解析回归（原 istringstream/sscanf 实现，行为一致）
+  {
+    Controller c6(SEED, dirs);
+    FlowAgg agg2;
+    for (uint64_t i = 0; i < 8; ++i) {
+      Header x = forward(kr, p0, 0, 9000 + i);
+      agg2.add(x.nonce, x.acc);
+    }
+    std::snprintf(line, sizeof(line), "FLOW %s 0 %llu %llu %llu", MAC,
+                  (unsigned long long)agg2.n, (unsigned long long)agg2.sum_h,
+                  (unsigned long long)agg2.sum_v);
+    ev = c6.feed(line);
+    CHECK(ev.kind == "flow" && ev.ok, "FLOW 手写解析判定通过");
+    // 制表符分隔：与旧 sscanf 的空白跳过语义一致
+    std::snprintf(line, sizeof(line), "FLOW %s\t0\t%llu\t%llu\t%llu", MAC,
+                  (unsigned long long)agg2.n, (unsigned long long)agg2.sum_h,
+                  (unsigned long long)agg2.sum_v);
+    ev = c6.feed(line);
+    CHECK(ev.kind == "flow" && ev.ok, "FLOW 制表符分隔仍通过");
+    // 畸形行全部拒绝（kind 空），与旧实现一致
+    CHECK(c6.feed("FLOW").kind == "", "FLOW 无空格前缀不分发");
+    CHECK(c6.feed("FLOW ").kind == "", "FLOW 空行被拒");
+    CHECK(c6.feed(std::string("FLOW ") + MAC).kind == "", "FLOW 缺数值字段被拒");
+    CHECK(c6.feed(std::string("FLOW ") + MAC + " 0 x 1 2").kind == "", "FLOW 非数值字段被拒");
+    // TRACE 手写解析 + 制表符：取证入库，篡改定位仍精确
+    {
+      Controller c7(SEED, dirs);
+      Header bad = forward(kr, p0, 0, 9100);
+      bad.acc ^= 1;
+      uint64_t h9 = h_of(9100);
+      uint64_t e1 = contribution(kr, p0[0], h9);
+      uint64_t e2 = addmod(e1, mulmod(contribution(kr, p0[1], h9), RHO));
+      std::snprintf(line, sizeof(line), "TRACE %s\t1\t1\t2\t0\t9100\t1\t%llu",
+                    MAC, (unsigned long long)e1);
+      c7.feed(line);
+      std::snprintf(line, sizeof(line), "TRACE %s 2 1 3 0 9100 2 %llu", MAC,
+                    (unsigned long long)(e2 ^ 1));
+      c7.feed(line);
+      std::snprintf(line, sizeof(line), "4 0 9100 %llu %s",
+                    (unsigned long long)bad.acc, MAC);
+      ev = c7.feed(line);
+      CHECK(!ev.ok && ev.suspect_sid == 2, "TRACE 手写解析定位仍精确");
+    }
+  }
+
   // 线程池（M5.16）：任务全完成、复用、空等待、栈收紧构造
   {
     mpv::ThreadPool pool(4, 256);
